@@ -141,25 +141,35 @@ blueprint/
 
 ---
 
-## 4. The two hard rules (from `spec.md`)
+## 4. The hard rules (from `spec.md`)
 
 These rules are **non-negotiable**. If a change you want to make would
-violate either of them, stop and ask.
+violate any of them, stop and ask.
 
 1. **The bootstrap application never runs OpenTofu. It is run manually.**
-   The bootstrap checks the system and provisions all the configuration
-   so a person can run it. In code terms:
+   OpenTofu provisions *infrastructure* (the kind cluster itself), and
+   that is always a manual step. In code terms:
    - `TofuRunner` exposes `init()`, `validate()`, `next_steps()`.
      It does **not** expose `apply()`.
    - `BootstrapApp.run()` stops after `tofu validate` and prints the
      commands the user runs.
-   - If you add a code path that calls `tofu apply` or `helm install`,
-     reject it.
+   - If you add a code path that calls `tofu apply`, reject it.
 
-2. **The bootstrap checks the system and provisions all the
-   configuration so a person can run it.** Bootstrap is a *preparation*
-   tool. It must not become an automation tool that silently creates
-   infrastructure on the user's behalf.
+2. **Phase 1 is preparation-only. Phase 2+ may install applications.**
+   - **Phase 1 (cluster)**: the bootstrap is a *preparation* tool. It
+     must not silently create infrastructure on the user's behalf. The
+     `HelmAppInstaller` for Phase 1 (Headlamp) prints the `helm install`
+     command for the user to run; it does not execute it.
+   - **Phase 2+ (application stack)**: the bootstrap **may** call
+     `helm install`, `kubectl apply`, init/unseal OpenBao, register the
+     Runner, etc. directly. These are *applications*, not infrastructure,
+     and the spec is fine with the bootstrap driving them end-to-end so
+     iteration is fast.
+   - The dividing line is **infrastructure vs. applications**. Anything
+     that creates/alters the cluster itself (kind nodes, network, host
+     mounts, TLS CA) stays manual. Anything that runs *on top of* an
+     existing cluster (GitLab, Runner, OpenBao, Traefik, app charts)
+     may be driven by the bootstrap in Phase 2+.
 
 ### Other rules (less strict but still apply)
 
@@ -186,6 +196,18 @@ violate either of them, stop and ask.
   re-interpreted as a nested mapping and the whole frontmatter fails
   to parse. Quoting with `'…'` is mandatory when the description
   contains colons or runs over 80 chars.
+- **`*.local.bruj0.net` is for humans, not for cluster traffic.**
+  Any hostname like `gitlab.local.bruj0.net` exists in DNS only on
+  the **developer's host** (via `/etc/hosts` + the local CA) so an
+  end-user can open it in a browser. Cluster-resident workloads
+  (the GitLab Runner pod, CI jobs, internal Travis callers, anything
+  pod-side) MUST use the **in-cluster Service DNS** instead:
+  `gitlab-webservice-default.gitlab.svc:8181`,
+  `openbao.openbao.svc:8200`, etc. The reason: there is no CoreDNS
+  rewrite for `*.local.bruj0.net` inside the cluster, so pods
+  resolve those hostnames to `127.0.0.1` and break. This applies
+  to every `gitlabUrl`/`apiUrl`/chart value that targets an
+  external hostname.
 - **Everything must be stored in `blueprint/`.** No stray files at the
   repo root or in `~`. The `apps/`, `infra/`, `data/`, `helm-charts/`
   layout is mandatory.

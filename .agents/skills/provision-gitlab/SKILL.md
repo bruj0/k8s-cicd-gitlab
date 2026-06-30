@@ -150,6 +150,65 @@ edit the right file, and move on.
 - OpenBao pod in `Running 0/1` phase is **expected** before init runs. Don't restart it; just run `bao operator init` once.
 - HTTPRoute binding shows `PROGRAMMED=Unknown` indefinitely → Traefik's Status condition only flips once a hostname actually resolves. With kind + port-forward, that resolves on first request; on bare clusters it may need a `resolver`. Don't chase this — verify with `curl` instead.
 - `+++/etc/hosts: Permission denied` when adding `gitlab.local.bruj0.net` → add the entry with `sudo`: `echo "127.0.0.1 gitlab.local.bruj0.net openbao.local.bruj0.net" | sudo tee -a /etc/hosts`. Adjust the IPs if you want node-IP routing instead of port-forward.
+- **CRITICAL: `*.local.bruj0.net` is for browsers, not for cluster traffic.**
+  Pods that try to reach `https://gitlab.local.bruj0.net/...` resolve the
+  hostname to `127.0.0.1` (no CoreDNS rewrite exists inside the cluster),
+  so the request hits the pod itself and fails. Symptom: gitlab-runner
+  logs `dial tcp 127.0.0.1:443: connect: connection refused` and GitLab
+  shows `Ci::Runner.all` empty. Fix: pass the **in-cluster Service**
+  to every chart value that has a `gitlabUrl`-style flag, e.g.
+  `gitlab-webservice-default.gitlab.svc:8181` and
+  `openbao.openbao.svc:8200`. Add a CoreDNS rewrite if you really need
+  pods to use `*.local.bruj0.net`. See the matching rule in `AGENTS.md`.
+- `curl -k -H 'Host: gitlab.local.bruj0.net' https://<traefik>:443` →
+  `404 page not found` plain text but the upstream service answers
+  `200 GitLab OK` on a direct port-forward → Traefik Gateway/HTTPRoute
+  pair is not binding. Two known triggers:
+  (a) gateway-api CRDs at v1.2.1 are too old for Traefik 41.x's
+  match-by-hostname logic, and
+  (b) the HTTPRoute's `parentRefs` should also carry
+  `allowedRoutes.namespaces.from: All` from the Gateway, which it does
+  — so the issue is in (a). Fix used by this skill: bump CRDs to
+  v1.3+, or replace Traefik with Envoy (which has its own
+  v1.3-aware gateway-api chart — see SKILL Note "Envoy switch").
+- `httproute-openbao.yaml` references `Service/openbao-ui` but
+  `kubectl -n openbao get svc` shows only `openbao` (and
+  `openbao-internal`). The OpenBao chart's `ui-service.yaml` template
+  is rendered with the *fullname* helper, which for release=openbao,
+  chart=openbao yields `openbao-openbao-ui` in some chart revisions
+  but a bare `openbao-ui` in others — and the v0.10.1 chart we use
+  produces `openbao` only (the "ui" service merges into the main
+  Service). Fix: `backendRefs.name: openbao` (not `openbao-ui`).
+
+## Rules of thumb (apply when adding Phase-2 charts)
+
+When you set a chart's `*Url`, `*Host`, or `*Endpoint` flag, ask
+**who is the caller?** — a developer's browser, or a pod inside the
+cluster? Use the rule:
+
+- Browser / host machine → `*.local.bruj0.net` (relies on `/etc/hosts`
+  on the developer's laptop; no service mesh, no TLS offloading).
+- Pod inside the cluster → in-cluster Service DNS: `svc-name.ns.svc:port`
+  (no DNS rewrites required; works on a fresh `kind` cluster).
+
+This applies to at least: GitLab Runner `gitlabUrl`, GitLab `sshHost`,
+the future GitLab Runner registration, anything chart-level that takes
+a hostname.
+
+## Rules of thumb (apply when adding Phase-2 charts)
+
+When you set a chart's `*Url`, `*Host`, or `*Endpoint` flag, ask
+**who is the caller?** — a developer's browser, or a pod inside the
+cluster? Use the rule:
+
+- Browser / host machine → `*.local.bruj0.net` (relies on `/etc/hosts`
+  on the developer's laptop; no service mesh, no TLS offloading).
+- Pod inside the cluster → in-cluster Service DNS: `svc-name.ns.svc:port`
+  (no DNS rewrites required; works on a fresh `kind` cluster).
+
+This applies to at least: GitLab Runner `gitlabUrl`, GitLab `sshHost`,
+the future GitLab Runner registration, anything chart-level that takes
+a hostname.
 
 ## When the install is green
 

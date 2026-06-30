@@ -193,8 +193,10 @@ class HelmAppInstaller:
         # the repo doesn't exist). The chart is cached at infra/helm-charts/<name>.tgz
         # — the helm call uses that local path, not the repo, but the repo
         # must be added once for `helm pull` to work the first time.
+        # Vendored charts (no `url`) skip this.
         cfg = helm_repo(self._spec.repo_key)
-        self._ensure_repo(cfg["name"], cfg["url"])
+        if not self._is_vendored(cfg):
+            self._ensure_repo(cfg["name"], cfg["url"])
 
         # helm reads the cached .tgz directly when we pass an absolute path,
         # so we don't need network access on subsequent runs.
@@ -202,6 +204,18 @@ class HelmAppInstaller:
         self._r.run(argv)
         self._log.ok(f"Installed {self._spec.release} into namespace {self._spec.namespace}")
         return result
+
+    def _is_vendored(self, cfg: dict) -> bool:
+        """True if the chart is sourced from a local path (no helm repo)."""
+        return cfg.get("_source") == "vendored"
+
+    def user_handoff_steps(self) -> list[UserStep]:
+        """Default: no extra user steps after install.
+
+        Override in subclasses that need URL discovery / token mint /
+        CA export etc. (e.g. HeadlampInstaller, OpenBaoInstaller).
+        """
+        return []
 
     def _ensure_repo(self, repo_name: str, repo_url: str) -> None:
         """Add the helm repo if not already present (idempotent)."""

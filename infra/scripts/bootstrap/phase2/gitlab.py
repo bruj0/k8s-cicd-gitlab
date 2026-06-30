@@ -258,7 +258,6 @@ class GitlabInstaller(HelmAppInstaller):
         return GitlabCredentials(initial_root_password=root_pw, runner_registration_token=runner_token)
 
     def user_handoff_steps(self) -> list[UserStep]:
-        kubeconfig_export = f"export KUBECONFIG={self._paths.tofu_dir}/kubeconfig"
         return [
             UserStep(
                 title="GitLab is up at https://gitlab.local.bruj0.net (trust the self-signed CA first).",
@@ -266,9 +265,8 @@ class GitlabInstaller(HelmAppInstaller):
                     "# Trust the local CA on your host:",
                     f"sudo trust anchor {self._paths.tls_public}/ca.crt",
                     "",
-                    "# Read the initial root password from OpenBao:",
-                    f"{kubeconfig_export}",
-                    f"KUBECONFIG=$PWD/infra/tofu/kubeconfig kubectl exec -n openbao openbao-0 -- bao kv get -format=json secret/gitlab | jq -r '.data.data.initial_root_password'",
+                    "# Read the initial root password from OpenBao (auto-port-forwards):",
+                    "uv run blueprint-secrets read gitlab initial_root_password",
                 ),
             ),
         ]

@@ -1,56 +1,48 @@
-"""Phase 2: provision GitLab + Runner + OpenBao + Traefik into a Phase-1 cluster.
+"""Phase 2: provision GitLab + Runner + OpenBao into a Phase-1 cluster.
 
 This subpackage is invoked by `BootstrapApp.run()` when `--phase 2` is
 passed. Unlike Phase 1 (which only prepares and prints), Phase 2 ACTUALLY
 runs `helm install` and `kubectl apply` — the spec rule that protected
-Phase 1 from `tofu apply` does not extend to helm/kubectl, and iteration
-needs the actual install to run.
+Phase 1 from `tofu apply` does not extend to helm/kubectl.
 
 Public surface:
 
     Pipeline orchestration:
-        Phase2Pipeline      7-step install orchestrator (called from app.py)
+        Phase2Pipeline      orchestrator (called from app.py)
         Phase2Installers    dataclass bundling every installer
 
     Per-component installers:
-        WildcardCertInstaller   republishes Phase 1's CA-signed wildcard
-                                cert as kubernetes.io/tls Secrets
-        TraefikInstaller        Gateway API reverse proxy
+        GatewayCRDsInstaller    upstream + Envoy Gateway API CRDs
         OpenBaoInstaller        KV secret store + init/unseal
-        GitlabInstaller         the big chart (with post-install secret capture)
+        GitlabInstaller         the big chart + Envoy sub-chart
+                                (with post-install secret capture)
         GitLabRunnerInstaller   registers against GitLab
 
     Supporting classes:
-        OpenBaoClient      `kubectl exec ... bao ...` wrapper
-        GatewayApplier     kubectl apply for Gateway + HTTPRoute YAMLs
+        OpenBaoClient      hvac-backed client with auto port-forward
+                            (replaces the old `kubectl exec ... bao ...` wrapper)
 
-The iteration loop (run, observe, fix, repeat) is documented in
+The iteration loop is documented in
 `.agents/skills/provision-gitlab/SKILL.md`.
 """
 
 from .catalog import Phase2Installers
-from .cert import CertSecret, TLS_NAMESPACES, WildcardCertInstaller
-from .gateway import GatewayApplier, MANIFESTS as GATEWAY_MANIFESTS
+from .gateway import GATEWAY_API_STANDARD_URL, GatewayCRDsInstaller
 from .gitlab import GitlabCredentials, GitlabInstaller
 from .openbao import OpenBaoInitOutput, OpenBaoInstaller
 from .pipeline import Phase2Pipeline
 from .runner import GitLabRunnerInstaller
 from .secrets import OpenBaoClient
-from .traefik import TraefikInstaller
 
 __all__ = [
     "Phase2Installers",
     "Phase2Pipeline",
-    "CertSecret",
-    "TLS_NAMESPACES",
-    "WildcardCertInstaller",
-    "GatewayApplier",
-    "GATEWAY_MANIFESTS",
+    "GatewayCRDsInstaller",
+    "GATEWAY_API_STANDARD_URL",
     "GitlabCredentials",
     "GitlabInstaller",
     "OpenBaoInitOutput",
     "OpenBaoInstaller",
     "GitLabRunnerInstaller",
     "OpenBaoClient",
-    "TraefikInstaller",
 ]

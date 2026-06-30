@@ -2,28 +2,35 @@
 
 Phases:
   1. Bootstrap checks the host for required tools, provisions the working
-     tree (tfvars, PKI, helm chart cache), and PRINTS the next commands.
-     It never invokes `tofu apply`. (See `spec.md` rule: "The bootstrap
+     tree (tfvars, helm chart cache), and PRINTS the next commands. It
+     never invokes `tofu apply`. (See `spec.md` rule: "The bootstrap
      application checks the system and provisions all the configuration
-     so a person can run it.")
+     so a person can run it.") PKI is no longer minted here — cert-manager
+     inside the cluster mints the wildcard cert via the
+     `local-bruj0-net-ca` Helm chart in Phase 2.
 
-  2. Bootstrap ACTUALLY installs Phase 2 (Traefik + OpenBao + GitLab +
-     Runner + Gateway API manifests). The spec rule from Phase 1 was
-     scoped to OpenTofu; helm/kubectl ARE applied by the bootstrap so
-     iteration can test results. Every step is idempotent so re-runs are
-     safe.
+  2. Bootstrap ACTUALLY installs Phase 2 (OpenBao + GitLab + Runner +
+     cert-manager + the `local-bruj0-net-ca` chart + the
+     `local-bruj0-net-gateway` chart). The reverse proxy is **not** a
+     separate install — the GitLab chart's
+     `global.gatewayApi.installEnvoy: true` in `VERSIONS.json` makes the
+     chart deploy Envoy Gateway (via its `gateway-helm` sub-chart)
+     when GitLab is installed. The spec rule from Phase 1 was scoped to
+     OpenTofu; helm/kubectl ARE applied by the bootstrap so iteration
+     can test results. Every step is idempotent so re-runs are safe.
 
 Run vs read at a glance:
 
-    [bootstrap]  checks host prereqs, installs missing tools, mints PKI,
-                 seeds tfvars, runs `tofu init` + `tofu validate`,
-                 caches the Headlamp chart, then STOPS (Phase 1).
+    [bootstrap]  checks host prereqs, installs missing tools, seeds
+                 tfvars, runs `tofu init` + `tofu validate`, caches the
+                 Headlamp chart, then STOPS (Phase 1).
     [user]       inspects `tofu plan`, runs `tofu apply`, runs
                  `kubectl get nodes`, runs `helm install` for Headlamp
                  (Phase 1's user handoff).
-    [bootstrap]  installs Traefik + OpenBao + GitLab + Runner + Gateway
-                 in order, with idempotency probes + retry-safe steps
-                 (Phase 2).
+    [bootstrap]  installs OpenBao + GitLab (with Envoy Gateway sub-chart
+                 + cert-manager sub-chart) + our SelfSigned CA + our
+                 wildcard Gateway + Runner, in that order, with
+                 idempotency probes + retry-safe steps (Phase 2).
 
 Every line printed by this app is prefixed `[bootstrap]` or `[user]`
 so the boundary between the two is unambiguous in the terminal.
@@ -42,10 +49,9 @@ from .logger import ConsoleLogger, Logger
 from .os_detect import detect_os, is_supported
 from .paths import Paths
 from .phase2 import (
-    GatewayApplier, OpenBaoClient, Phase2Installers, Phase2Pipeline,
-    WildcardCertInstaller,
+    OpenBaoClient, Phase2Installers, Phase2Pipeline,
 )
-from .pki import PkiRunner
+from .phase2.gateway import GatewayCRDsInstaller
 from .prereq import PrereqRegistry
 from .shell import CommandRunner, DryRunRunner, SubprocessRunner
 from .tofu import TofuRunner
@@ -135,7 +141,6 @@ class BootstrapApp:
 
         # Phase 1 collaborators.
         self.prereqs = PrereqRegistry.default(runner)
-        self.pki = PkiRunner(runner, paths)
         self.tofu = TofuRunner(runner, paths, log)
         self.chart_cache = HelmChartCache(runner, paths, log)
         self.headlamp = HeadlampInstaller(runner, paths, self.chart_cache, log)
@@ -148,18 +153,19 @@ class BootstrapApp:
         from .phase2.gitlab import GitlabInstaller
         from .phase2.openbao import OpenBaoInstaller
         from .phase2.runner import GitLabRunnerInstaller
-        from .phase2.traefik import TraefikInstaller
 
         # The init file doesn't exist yet during bootstrap construction;
         # we set it once OpenBaoInstaller initializes the server. The
         # GitLab + Runner installers share this client so the auth
         # state (login + KV v2 mount) propagates to every kv_put/kv_get.
+        #
+        # The reverse proxy is delivered by the GitLab chart's
+        # `gateway-helm` sub-chart (Envoy Gateway). The TLS cert is
+        # delivered by the chart's `shared-secrets/self-signed-cert-job`
+        # pre-install hook (cfssl self-sign, no DNS challenges).
         self._phase2_openbao_client = OpenBaoClient(runner, paths, log)
-        self._phase2_cert = WildcardCertInstaller(runner, paths, log)
-        self._phase2_gateway = GatewayApplier(runner, paths, log)
         self._phase2_installers = Phase2Installers(
-            cert=self._phase2_cert,
-            traefik=TraefikInstaller(runner, paths, self.chart_cache, log),
+            crds=GatewayCRDsInstaller(runner, paths, log),
             openbao=OpenBaoInstaller(runner, paths, self.chart_cache, log),
             gitlab=GitlabInstaller(runner, paths, self.chart_cache, log, self._phase2_openbao_client),
             runner=GitLabRunnerInstaller(runner, paths, self.chart_cache, log, self._phase2_openbao_client),
@@ -167,8 +173,6 @@ class BootstrapApp:
         self.phase2 = Phase2Pipeline(
             paths=paths, runner=runner, log=log,
             installers=self._phase2_installers,
-            gateway=self._phase2_gateway,
-            cert=self._phase2_cert,
         )
 
     @classmethod
@@ -245,11 +249,12 @@ class BootstrapApp:
             self._app("--user: skipping all prep, only printing the handoff commands.")
         else:
             self._app("This app will:")
-            self._app("    1. check / install host prereqs (docker, kubectl, kind, helm, tofu, openssl)")
-            self._app("    2. mint a local CA + wildcard cert under infra/tls/")
-            self._app("    3. run `tofu init` + `tofu validate` (NOT `tofu apply`)")
-            self._app("    4. cache the Headlamp chart under infra/helm-charts/")
-            self._app("    5. print the commands YOU then run manually")
+            self._app("    1. check / install host prereqs (docker, kubectl, kind, helm, tofu)")
+            self._app("    2. run `tofu init` + `tofu validate` (NOT `tofu apply`)")
+            self._app("    3. cache the Headlamp chart under infra/helm-charts/")
+            self._app("    4. print the commands YOU then run manually")
+            self._app("    (PKI is no longer minted here — cert-manager in Phase 2")
+            self._app("     mints the wildcard cert via local-bruj0-net-ca chart.)")
         self.log.info("")
 
         if not is_supported(family) and not (args.check or args.skip_install) and not args.user:
@@ -273,7 +278,7 @@ class BootstrapApp:
             return 0 if ok else 1
 
         # Step 1: install any missing prereqs
-        self._banner("[bootstrap] Step 1/4  Install any missing host prereqs")
+        self._banner("[bootstrap] Step 1/3  Install any missing host prereqs")
         installer = installer_for(family, self.runner)
         report = self.prereqs.ensure_all(installer)
         self._print_report(report)
@@ -281,22 +286,18 @@ class BootstrapApp:
             self._app_err("Docker daemon unreachable. Start it (e.g. `sudo systemctl start docker`) and re-run.")
             return 1
 
-        # Step 2: PKI
-        self._banner("[bootstrap] Step 2/4  Mint local CA + wildcard cert")
-        self.pki.ensure(args.domain)
-
-        # Step 3: tofu init + validate (downloads providers, checks syntax).
+        # Step 2: tofu init + validate (downloads providers, checks syntax).
         # Spec rule: bootstrap never runs `tofu apply`.
-        self._banner("[bootstrap] Step 3/4  Initialise + validate OpenTofu (no apply)")
+        self._banner("[bootstrap] Step 2/3  Initialise + validate OpenTofu (no apply)")
         self.tofu.seed_tfvars_if_missing()
         self.tofu.init()
         self.tofu.validate()
 
-        # Step 4: cache the Headlamp chart (no install; user runs helm).
-        self._banner("[bootstrap] Step 4/4  Cache Headlamp helm chart (no install)")
+        # Step 3: cache the Headlamp chart (no install; user runs helm).
+        self._banner("[bootstrap] Step 3/3  Cache Headlamp helm chart (no install)")
         headlamp = self.headlamp.prepare()
 
-        # Step 5: hand off to the user.
+        # Hand off to the user.
         self._print_user_handoff(headlamp)
         return 0
 
@@ -310,7 +311,7 @@ class BootstrapApp:
         args = self.args
         family, distro = detect_os()
 
-        self._banner("Phase 2 bootstrap — install GitLab + Runner + OpenBao + Traefik")
+        self._banner("Phase 2 bootstrap — install GitLab + Runner + OpenBao (chart-managed Envoy Gateway + self-signed wildcard cert)")
         self._app(f"Blueprint root: {self.paths.blueprint_dir}")
         self._app(f"OS family:      {family}{f' ({distro})' if distro else ''}")
         mode = self._describe_mode(args)
@@ -321,12 +322,16 @@ class BootstrapApp:
         else:
             self._app("This will:")
             self._app("    1. pre-flight (cluster reachable, helm installed)")
-            self._app("    2. publish the Phase-1 wildcard TLS cert into gitlab+openbao namespaces")
-            self._app("    3. install Traefik with Gateway API CRDs")
-            self._app("    4. install + initialise + unseal OpenBao")
-            self._app("    5. apply Gateway + HTTPRoute manifests")
-            self._app("    6. install GitLab (min config) + capture initial creds into OpenBao")
-            self._app("    7. install GitLab Runner (registers against gitlab.local.bruj0.net)")
+            self._app("    2. install Gateway API CRDs (Envoy needs them upstream)")
+            self._app("    3. install + initialise + unseal OpenBao")
+            self._app("    4. install GitLab — chart bundles Envoy Gateway + mints")
+            self._app("       a self-signed wildcard cert for *.local.bruj0.net")
+            self._app("    5. install GitLab Runner (gitlabUrl points at")
+            self._app("       gitlab-webservice-default.gitlab.svc:8181)")
+            self._app("")
+            self._app("DNS hint: add `127.0.0.1 gitlab.local.bruj0.net registry.local.bruj0.net")
+            self._app("   kas.local.bruj0.net minio.local.bruj0.net` to /etc/hosts,")
+            self._app("   or point local.bruj0.net at your kind node IP.")
         self.log.info("")
 
         if args.user:

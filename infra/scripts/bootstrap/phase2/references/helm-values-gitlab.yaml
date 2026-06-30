@@ -1,13 +1,30 @@
-# GitLab CE values for Phase 2 (minimal).
+# GitLab CE values for Phase 2.
 #
-# Per spec: "Minimal configuration". In practice that means we accept
-# the chart's bundled Postgres/Redis/MinIO/Gitalia defaults but disable
-# the bundled Ingress — Traefik's Gateway API does the routing via the
-# httproute-gitlab.yaml manifest.
+# The chart owns nearly everything. We override only what the chart
+# doesn't pick from the cluster's runtime context:
 #
-# Iteration note: GitLab's chart is heavy. If you OOM on a 4 GB worker,
-# bump the worker count via tofu.tfvars and re-run `tofu apply`. Or
-# set `global.postgresql.resources.requests.memory: 1Gi` etc. below.
+#   - global.hosts.domain / externalIP — the chart uses these to
+#      assemble `gitlab.<domain>` URLs and to bind the Gateway's
+#      loadBalancer-style address. We use local.bruj0.net for dev;
+#      the user updates DNS (or /etc/hosts) to the cluster IP
+#      manually — see Phase 2's end-of-run handoff.
+#
+#   - global.ingress.enabled: false — we route via Gateway API.
+#
+#   - global.gatewayApi.* — turn on Envoy Gateway + chart-managed
+#      Gateway. `configureCertmanager` is OFF so the chart's
+#      self-signed-cert-job (pre-install hook) mints a wildcard
+#      cert for `*.local.bruj0.net` and stores it in Secret
+#      `gitlab-wildcard-tls` (plus `gitlab-wildcard-tls-ca`).
+#
+#   - gatewayApiResources.gateway.listeners.gitlab-web.tls.certificateRefs[0].name
+#      — chart default is `gitlab-tls` (cert-manager path). We
+#      override to `gitlab-wildcard-tls` (self-signed path) so the
+#      Gateway listener can find the Secret the chart's pre-install
+#      Job creates.
+#
+#   - resource caps on Postgres/Redis/MinIO to fit on the 3×4 GB
+#      kind workers.
 
 global:
   edition: ce
@@ -15,61 +32,60 @@ global:
     domain: local.bruj0.net
     externalIP: 127.0.0.1
     https: true
-  # Disable the chart's Ingress resource; we route via Gateway API.
+  # Ingress disabled — we route via Gateway API.
   ingress:
     enabled: false
-  # The chart can also create a Gateway resource directly. Disable
-  # because we manage the Gateway ourselves in gateway.yaml.
+  # Activate the chart's Envoy Gateway sub-chart.
+  gatewayApi:
+    enabled: true
+    installEnvoy: true
+    # ConfigureCertmanager OFF → chart's pre-install hook
+    # (templates/shared-secrets/self-signed-cert-job.yml) mints
+    # a wildcard self-signed cert (Secret gitlab-wildcard-tls)
+    # via cfssl-self-sign. The chart's NOTES.txt prints the
+    # exact `kubectl get secret ... | base64 -d > ca.crt`
+    # command so the user can trust the CA on their host.
+    configureCertmanager: false
+    httpToHttpsRedirect: true
+  # Chart-managed Gateway (gitlab-gw). We use the chart's own
+  # Gateway + HTTPRoutes for gitlab/registry/kas/minio; OpenBao
+  # is reached via `kubectl port-forward` (no custom Gateway
+  # needed — the bootstrap prints the port-forward command).
   gateway:
-    enabled: false
-  # We want GitLab to read its initial root password from a Kubernetes
-  # Secret (which the GitLab installer writes from OpenBao after install).
-  # In iteration-2 we'll switch this to `openbao` directly. For now,
-  # `kubernetes` is the simplest backend that satisfies the chart.
+    enabled: true
+  # GitLab reads its initial root password from a Kubernetes
+  # Secret that the GitlabInstaller writes after install.
   appConfig:
     secretBackend:
       type: kubernetes
       kubernetes:
         secretName: gitlab-secret-backend
 
-# The bundled certmanager-issuer sub-chart requires an `email`
-# field even if we never actually use Let's Encrypt (we terminate
-# TLS via Traefik + the Phase-1 wildcard cert). Provide a no-op
-# value so the sub-chart renders. The actual issuer is never used.
-certmanager-issuer:
-  email: dev@local.bruj0.net
-  rbac:
-    create: false
-  common:
-    enabled: false
+# Override the chart's default Gateway listener cert-ref. The chart
+# default (`gitlab-tls`) is the name the chart uses for the
+# cert-manager-issued cert. With configureCertmanager: false the
+# chart instead mints `gitlab-wildcard-tls` (and `-ca`) via
+# cfssl-self-sign. The Gateway listener needs to match.
+gatewayApiResources:
+  gateway:
+    listeners:
+      gitlab-web:
+        tls:
+          certificateRefs:
+            - name: gitlab-wildcard-tls
 
-# Resource limits: keep everything small enough to fit on 3 workers
-# × 4 GB. Bump if OOM kills during install.
-# (Iteration 2: tune per-component. The defaults here are conservative
-# to keep the install green on the dev cluster.)
+# Resource caps so GitLab fits on 3×4 GB kind workers.
 postgresql:
   resources:
-    requests:
-      cpu: 100m
-      memory: 256Mi
-    limits:
-      cpu: 1000m
-      memory: 1Gi
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 1000m, memory: 1Gi }
 
 redis:
   resources:
-    requests:
-      cpu: 50m
-      memory: 64Mi
-    limits:
-      cpu: 500m
-      memory: 256Mi
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
 
 minio:
   resources:
-    requests:
-      cpu: 50m
-      memory: 64Mi
-    limits:
-      cpu: 250m
-      memory: 256Mi
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 250m, memory: 256Mi }

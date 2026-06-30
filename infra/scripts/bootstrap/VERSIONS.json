@@ -39,13 +39,6 @@
         "service": { "type": "NodePort" }
       }
     },
-    "traefik": {
-      "name": "traefik",
-      "url": "https://traefik.github.io/charts",
-      "chart": "traefik",
-      "chart_version": "41.0.1",
-      "values_overrides": {}
-    },
     "openbao": {
       "name": "openbao",
       "url": "https://openbao.github.io/openbao-helm",
@@ -73,12 +66,11 @@
             "https": true
           },
           "ingress": { "enabled": false },
-          "gateway": { "enabled": false },
-          "appConfig": {
-            "secretBackend": {
-              "type": "kubernetes",
-              "kubernetes": { "secretName": "gitlab-secret-backend" }
-            }
+          "gatewayApi": {
+            "enabled": true,
+            "installEnvoy": true,
+            "configureCertmanager": false,
+            "httpToHttpsRedirect": true
           }
         }
       }
@@ -89,7 +81,7 @@
       "chart": "gitlab-runner",
       "chart_version": "0.71.0",
       "values_overrides": {
-        "gitlabUrl": "https://gitlab.local.bruj0.net",
+        "gitlabUrl": "http://gitlab-webservice-default.gitlab.svc:8181",
         "runners": {
           "executor": "kubernetes",
           "kubernetes": {
