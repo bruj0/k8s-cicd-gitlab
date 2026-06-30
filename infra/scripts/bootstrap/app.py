@@ -150,6 +150,10 @@ class BootstrapApp:
         from .phase2.runner import GitLabRunnerInstaller
         from .phase2.traefik import TraefikInstaller
 
+        # The init file doesn't exist yet during bootstrap construction;
+        # we set it once OpenBaoInstaller initializes the server. The
+        # GitLab + Runner installers share this client so the auth
+        # state (login + KV v2 mount) propagates to every kv_put/kv_get.
         self._phase2_openbao_client = OpenBaoClient(runner, paths, log)
         self._phase2_cert = WildcardCertInstaller(runner, paths, log)
         self._phase2_gateway = GatewayApplier(runner, paths, log)

@@ -94,7 +94,14 @@ class SubprocessRunner:
         return self._finalise(cmd, check, cp)
 
     def _finalise(self, cmd: list[str], check: bool, cp: "subprocess.CompletedProcess[str]") -> CommandResult:
-        result = CommandResult(cp.returncode, cp.stdout, cp.stderr)
+        # Force-decode stdout/stderr to str so all consumers (JSON.parse,
+        # strip/lower/split, etc.) can treat it the same way as the
+        # DryRunRunner's empty-string contract.
+        def _decode(b: object) -> str:
+            if isinstance(b, (bytes, bytearray)):
+                return b.decode("utf-8", errors="replace")
+            return str(b or "")
+        result = CommandResult(cp.returncode, _decode(cp.stdout), _decode(cp.stderr))
         if check and not result.ok:
             raise CommandFailed(cmd, result)
         return result

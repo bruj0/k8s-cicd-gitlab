@@ -31,24 +31,129 @@ POD_NAME = "openbao-0"
 class OpenBaoClient:
     """`kubectl exec` wrapper around the `bao` CLI."""
 
-    def __init__(self, runner: CommandRunner, paths: Paths, log: Logger) -> None:
+    def __init__(self, runner: CommandRunner, paths: Paths, log: Logger,
+                 init_file: Path | None = None) -> None:
         self._r = runner
         self._paths = paths
         self._log = log
-        # Token is loaded lazily from the init file. We don't require it
-        # at construction because `bao operator init` and `bao operator
-        # unseal` are unauthenticated operations.
+        # Path to the init JSON. We load the token lazily — first
+        # authenticated command triggers it. Init/unseal are anonymous.
+        self._init_file = init_file
         self._token: str | None = None
+
+    # ---------- auth ----------
+
+    def _ensure_token(self) -> str:
+        """Load the root token from the init file. Idempotent.
+
+        Falls back to empty string (anonymous mode) when the file
+        doesn't exist yet — useful for `bao operator init` / `status`
+        before any client has logged in. Authenticated commands must
+        trigger this *after* init has run.
+        """
+        if self._token:
+            return self._token
+        if self._init_file is None or not self._init_file.exists():
+            return ""
+        # Lazy-import json to keep module import side-effect free.
+        import json as _json
+        try:
+            data = _json.loads(self._init_file.read_text())
+            self._token = data["root_token"]
+        except Exception as e:
+            raise RuntimeError(
+                f"could not load root_token from {self._init_file}: {e}"
+            )
+        return self._token
+
+    def login(self) -> None:
+        """Set the OpenBao token inside the openbao-0 pod.
+
+        Runs `bao login -` inside the pod, with the token on stdin.
+        The CLI caches it in `~/.vault-token` so subsequent
+        `bao kv put`, `bao secrets enable`, etc. succeed without
+        re-auth.
+
+        Why one-time login vs per-call `VAO_TOKEN=` env? Because we
+        exec via `kubectl exec ... --` (no env injection possible from
+        the host side). The CLI's persistent token file is what makes
+        repeated calls work without re-auth.
+        """
+        token = self._ensure_token()
+        if not token:
+            return  # Not yet initialised; nothing to log in with.
+        self.raw(["login", "-"], check=False, stdin=token + "\n")
 
     # ---------- low-level ----------
 
-    def raw(self, bao_cmd: list[str], *, check: bool = True) -> CommandResult:
+    def raw(self, bao_cmd: list[str], *, check: bool = True,
+            stdin: str | None = None) -> CommandResult:
         """Run a `bao` subcommand inside the openbao-0 pod.
 
         Example: `client.raw(["status"])` runs `bao status` inside the pod.
+        When `stdin` is passed, `-i` is added to `kubectl exec` so the
+        stdin payload reaches the remote `bao` process — without it,
+        stdin is silently dropped.
         """
-        cmd = ["kubectl", "exec", "--namespace", "openbao", POD_NAME, "--", "bao", *bao_cmd]
-        return self._r.run(cmd, check=check)
+        cmd = ["kubectl", "exec", "--namespace", "openbao"]
+        if stdin is not None:
+            cmd.append("-i")
+        cmd += [POD_NAME, "--", "bao", *bao_cmd]
+        return self._r.run(cmd, check=check, stdin=stdin)
+
+    # ---------- mounts ----------
+
+    def is_kv_v2_enabled(self, path: str = "secret") -> bool:
+        """Return True if `secret/<path>` is mounted as kv-v2 already.
+
+        Used by callers to avoid re-running `secrets enable` (which
+        errors on subsequent calls). `bao secrets list -format=json`
+        returns a dict of mounted engines: `{ "secret/": {...} }`.
+        """
+        result = self.raw(["secrets", "list", "-format=json"], check=False)
+        if not result.ok or not result.stdout.strip():
+            return False
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return False
+        # The mount path key has a trailing slash, e.g. "secret/".
+        key = path if path.endswith("/") else f"{path}/"
+        entry = payload.get(key)
+        if not entry:
+            return False
+        return entry.get("type") == "kv" and str(entry.get("options", {}).get("version", "")) == "2"
+
+    def enable_kv_v2(self, path: str = "secret") -> None:
+        """Idempotently enable a kv-v2 engine at `path` (default: `secret`).
+
+        Required before any `kv put path/<sub>` call. Without it,
+        OpenBao returns `404 no handler for path "path/..."`.
+        Idempotent: errors are silently ignored if the mount already
+        exists (the call returns a `path is already in use` error).
+        """
+        if self.is_kv_v2_enabled(path):
+            self._log.info(f"KV v2 already enabled at {path}/")
+            return
+        self._log.info(f"Enabling KV v2 at {path}/")
+        result = self.raw(
+            ["secrets", "enable", "-path", path, "-version=2", "kv"], check=False
+        )
+        if not result.ok:
+            stderr = result.stderr.strip()
+            if "already in use" in stderr.lower():
+                self._log.info(f"KV mount at {path}/ already exists (idempotent)")
+                return
+            raise RuntimeError(f"bao secrets enable {path} failed: {stderr}")
+        self._log.ok(f"KV v2 mounted at {path}/")
+
+    def login(self) -> None:
+        """No-op stub kept here for backward compat with callers that
+        imported the old API. The real login() lives near the top of
+        this class."""
+        return None
+
+    # ---------- data ----------
 
     def kv_put(self, path: str, data: dict[str, str]) -> None:
         """`bao kv put secret/<path> k=v ...` — writes a KV v2 secret.
@@ -56,6 +161,9 @@ class OpenBaoClient:
         `data` becomes multiple key=value pairs in the same secret. We
         pass them as repeated `k=v` arguments so the user doesn't have to
         maintain a JSON file on the host.
+
+        Requires the caller to have called `login()` first (so the
+        server accepts writes).
         """
         args: list[str] = ["kv", "put", f"secret/{path}"]
         for k, v in data.items():

@@ -75,7 +75,16 @@ class OpenBaoInstaller(HelmAppInstaller):
                 ),
             ),
         )
-        self._client = OpenBaoClient(runner, paths, log)
+        # The init-file path doubles as the auth token source. The
+        # shared OpenBaoClient (constructed once in app.py) also takes
+        # this; we make sure of that here too.
+        self._client = OpenBaoClient(runner, paths, log,
+                                     init_file=self.init_file_path())
+
+    def reload_client(self, client: OpenBaoClient) -> None:
+        """Allow app.py to swap in the *shared* OpenBaoClient (so the
+        GitLab and Runner installers see the same auth state)."""
+        self._client = client
 
     # ---------- idempotency probes ----------
 
@@ -87,10 +96,15 @@ class OpenBaoInstaller(HelmAppInstaller):
         return self.init_file_path().exists()
 
     def is_sealed(self) -> bool:
-        """Returns True if the OpenBao server is sealed (needs unseal)."""
-        result = self._client.raw(["status"])
-        if not result.ok:
-            return True
+        """Returns True if the OpenBao server is sealed (needs unseal).
+
+        `bao status` returns exit code 2 when sealed (per OpenBao's
+        documented convention). We must use `check=False` so the runner
+        doesn't raise — `result.ok` is fine to read regardless.
+        """
+        result = self._client.raw(["status"], check=False)
+        if not result.ok and not result.stdout.strip():
+            return True  # pod unreachable or no output → assume sealed
         try:
             payload = json.loads(result.stdout)
         except Exception:
@@ -102,21 +116,53 @@ class OpenBaoInstaller(HelmAppInstaller):
     def install(self) -> HelmAppInstaller.AppPrepResultLike:
         """Install the chart AND ensure the server is initialised + unsealed.
 
-        Order: chart install → wait for pod → init (first run) → unseal.
+        Order: chart install → wait for pod `Running` (not Ready: OpenBao's
+        readiness probe enforces unsealed-state) → init (first run) →
+        unseal → wait until pod Ready.
         Returns the AppPrepResult from the chart install.
         """
         result = super().install()
-        self._wait_for_pod_ready()
+        self._wait_for_pod_running()
+        # Once the container is Running (not sealed-init barring the
+        # kernel-level storage to begin), the OpenBao listener accepts
+        # `bao operator init` over the unix socket / service. We init,
+        # then unseal — each idempotent against re-runs.
         if not self.is_initialised():
             self._init()
         if self.is_sealed():
             self._unseal()
+        # Finally block on Ready so downstream steps (Gateway applies
+        # that query Gateway resources, etc.) have a green pod.
+        self._wait_for_pod_ready()
         return result
 
     # ---------- internals ----------
 
+    def _wait_for_pod_running(self, timeout_s: int = 180) -> None:
+        """Block until `openbao-0` is at least `Running` (not necessarily `Ready`).
+
+        OpenBao's ReadinessProbe fails until the server is initialised AND
+        unsealed — but init/unseal happen in *this* installer right after
+        the chart install. So we wait only for `Running` here; the
+        subsequent `_init` / `_unseal` will take the pod from
+        `Running-but-unsealed` → `Ready`.
+        """
+        self._log.info(f"Waiting for pod {self.RELEASE}-0 to be Running in {self.NAMESPACE} (timeout {timeout_s}s)")
+        self._r.run([
+            "kubectl", "wait", "--namespace", self.NAMESPACE,
+            "--for=jsonpath={.status.phase}=Running",
+            f"pod/{self.RELEASE}-0",
+            f"--timeout={timeout_s}s",
+        ])
+        self._log.ok(f"Pod {self.RELEASE}-0 is Running")
+
     def _wait_for_pod_ready(self, timeout_s: int = 180) -> None:
-        """Block until `openbao-0` is Running and Ready, or raise."""
+        """Block until `openbao-0` is Running and Ready, or raise.
+
+        Convenience used by tests / assertions. Normal init flow uses
+        `_wait_for_pod_running` (which doesn't block on inited state)
+        + `_init` + `_unseal`.
+        """
         self._log.info(f"Waiting for pod {self.RELEASE}-0 in {self.NAMESPACE} (timeout {timeout_s}s)")
         self._r.run([
             "kubectl", "wait", "--namespace", self.NAMESPACE,

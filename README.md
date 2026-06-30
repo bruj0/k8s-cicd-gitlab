@@ -128,10 +128,11 @@ sudo trust anchor infra/tls/public/ca.crt
 #   infra/secrets/openbao-init.json, gitignored, chmod 600)
 ```
 
-Phase 2 runs the 7-step pipeline end-to-end. Every step is idempotent —
+Phase 2 runs the 8-step pipeline end-to-end. Every step is idempotent —
 **re-runs are safe**. If a step fails, fix the corresponding installer
 or YAML reference under `infra/scripts/bootstrap/phase2/` and re-run.
-The iteration loop is documented at
+The iteration loop (with a frozen list of known pitfalls) is documented
+at
 [`.agents/skills/provision-gitlab/SKILL.md`](.agents/skills/provision-gitlab/SKILL.md).
 
 ## Conventions

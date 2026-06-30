@@ -43,18 +43,8 @@
       "name": "traefik",
       "url": "https://traefik.github.io/charts",
       "chart": "traefik",
-      "chart_version": "36.4.0",
-      "values_overrides": {
-        "ports": {
-          "web": { "redirectTo": "websecure" }
-        },
-        "providers": {
-          "kubernetesGateway": { "enabled": true }
-        },
-        "ingressClass": {
-          "enabled": false
-        }
-      }
+      "chart_version": "41.0.1",
+      "values_overrides": {}
     },
     "openbao": {
       "name": "openbao",
@@ -71,9 +61,9 @@
     },
     "gitlab": {
       "name": "gitlab",
-      "url": "https://gitlab.gitlab.io/charts",
+      "url": "https://charts.gitlab.io",
       "chart": "gitlab",
-      "chart_version": "8.10.0",
+      "chart_version": "9.11.7",
       "values_overrides": {
         "global": {
           "edition": "ce",

@@ -36,16 +36,10 @@ class TraefikInstaller(HelmAppInstaller):
                 release=self.RELEASE,
                 namespace=self.NAMESPACE,
                 wait=False,  # Traefik has no Deployment by default, --wait would hang.
-                # Phase 2 values file lives at phase2/references/helm-values-traefik.yaml.
+                # All chart flags live in the YAML file (strict-schema
+                # friendly). See phase2/references/helm-values-traefik.yaml.
                 values_files=(
                     str(paths.phase2_refs_dir / "helm-values-traefik.yaml"),
-                ),
-                # Belt-and-braces Gateway API flags. Both keys exist in chart
-                # 36.x; one will win, the other is ignored. Re-check after
-                # bumping the chart.
-                extra_set=(
-                    ("providers.kubernetesGateway.enabled", "true"),
-                    ("experimental.kubernetesGateway.enabled", "true"),
                 ),
             ),
         )

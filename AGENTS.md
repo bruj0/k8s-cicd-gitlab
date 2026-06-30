@@ -107,15 +107,15 @@ blueprint/
     │       └── app_installer.py         # HelmAppInstaller generic + HeadlampInstaller subclass + installer_for() factory
     │       └── phase2/                  # Phase 2: install GitLab + Runner + OpenBao + Traefik
     │           ├── __init__.py          # re-exports Phase2Pipeline + installers
-    │           ├── pipeline.py          # 7-step orchestrator (called from app.py:BootstrapApp)
+    │           ├── pipeline.py          # 8-step orchestrator (called from app.py:BootstrapApp)
     │           ├── catalog.py           # Phase2Installers dataclass (bundle of every installer)
     │           ├── cert.py              # WildcardCertInstaller — republishes Phase-1 wildcard cert
     │           ├── traefik.py           # TraefikInstaller — reverse proxy with Gateway API
-    │           ├── openbao.py           # OpenBaoInstaller — chart install + init/unseal
-    │           ├── secrets.py           # OpenBaoClient — `kubectl exec ... bao ...` wrapper
-    │           ├── gitlab.py            # GitlabInstaller — chart + post-install secret capture
+    │           ├── openbao.py           # OpenBaoInstaller — chart install + init/unseal (also handles `Running` vs `Ready`)
+    │           ├── secrets.py           # OpenBaoClient — `kubectl exec ... bao ...` wrapper (login + kv v2 mount)
+    │           ├── gitlab.py            # GitlabInstaller — chart + set-root-password + capture runner token
     │           ├── runner.py            # GitLabRunnerInstaller — registers against gitlab.local.bruj0.net
-    │           ├── gateway.py           # GatewayApplier — kubectl apply for Gateway + HTTPRoute YAMLs
+    │           ├── gateway.py           # GatewayApplier — installs upstream CRDs + applies Gateway + HTTPRoute YAMLs
     │           └── references/          # install-time YAML (committed, see spec rule "templates must have their own files")
     │               ├── helm-values-traefik.yaml
     │               ├── helm-values-openbao.yaml

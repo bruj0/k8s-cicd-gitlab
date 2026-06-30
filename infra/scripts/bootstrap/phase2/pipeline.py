@@ -9,11 +9,13 @@ Step order matters:
 
     1. Pre-flight     cluster reachable, helm/kubectl on PATH
     2. TLS Secret     publish the Phase 1 wildcard cert into each namespace
-    3. Traefik        reverse proxy + Gateway API CRDs
-    4. OpenBao        install + init + unseal
-    5. Gateway+HTTPRoutes   apply GatewayClass, Gateway, HTTPRoutes
-    6. GitLab         install + capture initial creds into OpenBao
-    7. GitLab Runner  install using the runner registration token from OpenBao
+    3. Gateway CRDs   install kubernetes-sigs/gateway-api CRDs (GatewayClass,
+                       Gateway, HTTPRoute)
+    4. Traefik        reverse proxy (uses CRDs from step 3)
+    5. OpenBao        install + init + unseal
+    6. Gateway+HTTPRoutes   apply GatewayClass, Gateway, HTTPRoutes
+    7. GitLab         install + capture initial creds into OpenBao
+    8. GitLab Runner  install using the runner registration token from OpenBao
 
 Each step delegates to a single installer so the pipeline stays
 declarative. The pipeline owns ordering and error reporting, not the
@@ -59,6 +61,7 @@ class Phase2Pipeline:
         try:
             self._step_preflight()
             self._step_cert()
+            self._step_gateway_crds()
             self._step_traefik()
             self._step_openbao()
             self._step_gateway()
@@ -87,7 +90,7 @@ class Phase2Pipeline:
     # ---------- pre-flight ----------
 
     def _step_preflight(self) -> None:
-        self.log.info("[bootstrap] Step 1/7  Pre-flight (cluster reachable)")
+        self.log.info("[bootstrap] Step 1/8  Pre-flight (cluster reachable)")
         self.runner.run(["kubectl", "cluster-info"], check=True)
         self.runner.run(["helm", "version", "--short"], check=True)
         self.log.ok("cluster + helm are reachable")
@@ -95,41 +98,51 @@ class Phase2Pipeline:
     # ---------- cert ----------
 
     def _step_cert(self) -> None:
-        self.log.info("[bootstrap] Step 2/7  Publish wildcard TLS Secret in gitlab + openbao namespaces")
+        self.log.info("[bootstrap] Step 2/8  Publish wildcard TLS Secret in gitlab + openbao namespaces")
         self.cert.publish()
         self.log.ok("TLS Secrets are in place")
+
+    # ---------- gateway api crds ----------
+
+    def _step_gateway_crds(self) -> None:
+        # Not part of Traefik's chart; must be installed before any
+        # Gateway or HTTPRoute (manifest + Traefik's chart-rendered
+        # resources) can land in the cluster.
+        self.log.info("[bootstrap] Step 3/8  Install Gateway API CRDs (standard channel)")
+        self.gateway.ensure_crds()
+        self.log.ok("Gateway API CRDs are installed")
 
     # ---------- traefik ----------
 
     def _step_traefik(self) -> None:
-        self.log.info("[bootstrap] Step 3/7  Install Traefik (Gateway API CRDs)")
+        self.log.info("[bootstrap] Step 4/8  Install Traefik (uses Gateway API CRDs)")
         self.installers.traefik.install()
         self.log.ok("Traefik installed")
 
     # ---------- openbao ----------
 
     def _step_openbao(self) -> None:
-        self.log.info("[bootstrap] Step 4/7  Install + initialise + unseal OpenBao")
+        self.log.info("[bootstrap] Step 5/8  Install + initialise + unseal OpenBao")
         self.installers.openbao.install()
         self.log.ok("OpenBao is initialised and unsealed")
 
     # ---------- gateway ----------
 
     def _step_gateway(self) -> None:
-        self.log.info("[bootstrap] Step 5/7  Apply Gateway + HTTPRoute manifests")
+        self.log.info("[bootstrap] Step 6/8  Apply Gateway + HTTPRoute manifests")
         self.gateway.apply_all()
         self.log.ok("Gateway + HTTPRoutes applied")
 
     # ---------- gitlab ----------
 
     def _step_gitlab(self) -> None:
-        self.log.info("[bootstrap] Step 6/7  Install GitLab + capture credentials into OpenBao")
+        self.log.info("[bootstrap] Step 7/8  Install GitLab + capture credentials into OpenBao")
         self.installers.gitlab.install()
         self.log.ok("GitLab installed + credentials captured")
 
     # ---------- runner ----------
 
     def _step_runner(self) -> None:
-        self.log.info("[bootstrap] Step 7/7  Install GitLab Runner (registers against gitlab.local.bruj0.net)")
+        self.log.info("[bootstrap] Step 8/8  Install GitLab Runner (registers against gitlab.local.bruj0.net)")
         self.installers.runner.install()
         self.log.ok("GitLab Runner installed and registered")

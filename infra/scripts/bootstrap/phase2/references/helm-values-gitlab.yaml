@@ -32,11 +32,21 @@ global:
       kubernetes:
         secretName: gitlab-secret-backend
 
+# The bundled certmanager-issuer sub-chart requires an `email`
+# field even if we never actually use Let's Encrypt (we terminate
+# TLS via Traefik + the Phase-1 wildcard cert). Provide a no-op
+# value so the sub-chart renders. The actual issuer is never used.
+certmanager-issuer:
+  email: dev@local.bruj0.net
+  rbac:
+    create: false
+  common:
+    enabled: false
+
 # Resource limits: keep everything small enough to fit on 3 workers
 # × 4 GB. Bump if OOM kills during install.
 # (Iteration 2: tune per-component. The defaults here are conservative
 # to keep the install green on the dev cluster.)
-
 postgresql:
   resources:
     requests:
@@ -60,11 +70,6 @@ minio:
     requests:
       cpu: 50m
       memory: 64Mi
-
-# Disable Prometheus monitoring (saves resources; iteration 2 can turn back on).
-prometheus:
-  install: false
-
-# Disable the bundled SSH service — we expose git over HTTPS only.
-ssh:
-  enabled: false
+    limits:
+      cpu: 250m
+      memory: 256Mi
