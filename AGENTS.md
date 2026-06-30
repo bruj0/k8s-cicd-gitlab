@@ -173,6 +173,29 @@ violate any of them, stop and ask.
      the bootstrap in Phase 2+. The chart handles Envoy + cert for
      us; we don't manage either directly.
 
+3. **The only way to create or delete the cluster is `tofu` (OpenTofu).**
+   The kind cluster is the *one* piece of state owned by the IaC layer
+   in `infra/tofu/`. Concretely:
+   - **Create**: `tofu -chdir=infra/tofu apply -auto-approve`. No
+     `kind create cluster` ad-hoc commands, no docker-run a kind
+     container, no `kubectl` calls that assume the cluster exists.
+   - **Delete**: `tofu -chdir=infra/tofu destroy -auto-approve`. No
+     `kind delete cluster --name=cicd`, no `docker rm -f kind-cicd-*`,
+     no `kubectl delete namespace` to "tidy up" before destroy.
+   - The state in `infra/tofu/terraform.tfstate` is the source of
+     truth for "does the cluster exist?". `tofu state list` should
+     be empty after a successful destroy; a non-empty list when
+     `docker ps | grep kind-` is also empty means tofu thinks the
+     cluster is up but it isn't — the only safe fix is
+     `tofu state rm <orphan-resource>` (per resource), not
+     hand-deletion of state.
+   - If you find yourself wanting to bypass tofu "just this once"
+     because the cluster is in a weird state, stop and ask. The
+     bootstrap's idempotency story depends on the cluster being
+     either fully present (per state) or fully absent (per
+     state) — partial states produce half-broken Phase 2 installs
+     that are very hard to debug.
+
 ### Other rules (less strict but still apply)
 
 - **Shell scripts only if simple; otherwise Python following SOLID.**
