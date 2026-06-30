@@ -1,0 +1,56 @@
+"""Gateway API manifest applier.
+
+Phase 2 uses the Gateway API (per spec rule: "Traefik as reverse proxy
+with Gateway API support"). Traefik installs the CRDs as part of its
+chart, but the `Gateway`, `HTTPRoute`, and any TLS configs are not
+created by the chart — we apply them ourselves from YAML references.
+
+This class is the single point of contact for kubectl-apply on Phase 2
+gateway manifests. Each manifest lives at
+`infra/scripts/bootstrap/phase2/references/` and is referenced by name
+in the apply order declared below.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from ..logger import Logger
+from ..paths import Paths
+from ..shell import CommandRunner
+
+
+# Apply order matters: GatewayClass must exist before Gateway, Gateway
+# before HTTPRoute. Each entry is a file name relative to the references
+# directory.
+MANIFESTS: tuple[str, ...] = (
+    "gateway.yaml",           # GatewayClass + Gateway for *.local.bruj0.net
+    "httproute-gitlab.yaml",  # gitlab.local.bruj0.net  → gitlab-webservice
+    "httproute-openbao.yaml", # openbao.local.bruj0.net → openbao-ui
+)
+
+
+class GatewayApplier:
+    """Apply every Gateway API manifest in MANIFESTS, idempotently."""
+
+    def __init__(self, runner: CommandRunner, paths: Paths, log: Logger) -> None:
+        self._r = runner
+        self._paths = paths
+        self._log = log
+
+    def apply_all(self) -> list[Path]:
+        """Apply every manifest. Returns the list of applied file paths."""
+        refs_dir = self._paths.phase2_refs_dir
+        applied: list[Path] = []
+        for name in MANIFESTS:
+            path = refs_dir / name
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Phase 2 reference manifest not found: {path}. "
+                    f"Did you forget to commit the YAML under "
+                    f"`infra/scripts/bootstrap/phase2/references/`?"
+                )
+            self._r.run(["kubectl", "apply", "-f", str(path)])
+            self._log.ok(f"Applied Gateway manifest: {name}")
+            applied.append(path)
+        return applied

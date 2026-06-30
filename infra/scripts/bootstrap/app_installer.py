@@ -55,6 +55,9 @@ class HelmAppSpec:
     # (e.g. service.type=NodePort for Headlamp). These are appended after
     # the ones declared in VERSIONS so callers can override without editing JSON.
     extra_set: tuple[tuple[str, str], ...] = ()
+    # Absolute paths to helm values files, applied in order. Phase 2 uses
+    # this so install-time config lives in committed YAML references.
+    values_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,35 @@ class HelmAppInstaller:
         target = self._paths.helm_charts_dir / f"{cfg['chart']}-{cfg['chart_version']}.tgz"
         return target.exists()
 
+    def is_already_deployed(self) -> bool:
+        """Probe whether the release is already deployed in the cluster.
+
+        Default implementation calls `helm list` filtered by namespace +
+        release. Subclasses can override with a cheaper probe (e.g. an
+        existing `kubectl get deployment`) if they have one.
+
+        Used by Phase 2's pipeline for idempotency: if a release is
+        already deployed, we skip the `helm upgrade --install` but still
+        re-cache the chart and re-emit the install command (so re-runs
+        are safe and report what they did).
+        """
+        cmd = ["helm", "list", "--namespace", self._spec.namespace,
+               "--filter", self._spec.release,
+               "--output", "json"]
+        try:
+            result = self._r.run(cmd, check=True)
+        except Exception:
+            return False
+        if not result.stdout.strip():
+            return False
+        # helm list --output json returns "[]" or "[{...}]"
+        try:
+            import json as _json
+            rows = _json.loads(result.stdout)
+        except Exception:
+            return False
+        return any(row.get("name") == self._spec.release for row in rows)
+
     # ---------- main entrypoint ----------
 
     def prepare(self) -> AppPrepResult:
@@ -146,21 +178,48 @@ class HelmAppInstaller:
         fake_chart = CachedChart(name=cfg["chart"], version=cfg["chart_version"], path=fake_path)
         return self._build_result(fake_chart)
 
-    # ---------- extension hooks (override in subclasses) ----------
+    def install(self) -> AppPrepResult:
+        """Cache the chart, then ACTUALLY install it via `helm upgrade --install`.
 
-    def user_handoff_steps(self) -> list[UserStep]:
-        """Override to inject app-specific follow-up commands.
+        This is the Phase 2 entrypoint. Phase 1's `bootstrap.py` does NOT
+        call this — it sticks to `prepare()` and prints the command.
 
-        The default is empty — generic helm apps don't need anything beyond
-        the install command. Headlamp overrides this to add the URL-discovery
-        and token-mint steps. A future GitlabInstaller would override it
-        with the URL + initial-root-password steps.
+        Idempotent: `helm upgrade --install` is a no-op when the release
+        is at the same version. If you want to skip work entirely on
+        re-runs, use `is_already_deployed()` first.
         """
-        return []
+        result = self.prepare()
+        # Ensure the repo is registered locally (idempotent: helm errors if
+        # the repo doesn't exist). The chart is cached at infra/helm-charts/<name>.tgz
+        # — the helm call uses that local path, not the repo, but the repo
+        # must be added once for `helm pull` to work the first time.
+        cfg = helm_repo(self._spec.repo_key)
+        self._ensure_repo(cfg["name"], cfg["url"])
 
-    # ---------- internals ----------
+        # helm reads the cached .tgz directly when we pass an absolute path,
+        # so we don't need network access on subsequent runs.
+        argv = self._argv_for_install(result)
+        self._r.run(argv)
+        self._log.ok(f"Installed {self._spec.release} into namespace {self._spec.namespace}")
+        return result
+
+    def _ensure_repo(self, repo_name: str, repo_url: str) -> None:
+        """Add the helm repo if not already present (idempotent)."""
+        list_result = self._r.run(["helm", "repo", "list", "--output", "json"], check=False)
+        if list_result.ok and repo_name in list_result.stdout:
+            return
+        self._r.run(["helm", "repo", "add", repo_name, repo_url])
+        self._r.run(["helm", "repo", "update", repo_name])
 
     def _build_result(self, chart: CachedChart) -> AppPrepResult:
+        """Build the AppPrepResult for a chart.
+
+        Used by prepare() (real chart) and fake_prepare() (no I/O cheat).
+        Returns the AppPrepResult with both the human-readable cmd string
+        (for `--user` mode and logs) and the argv list embedded so
+        install() can re-derive the same command without re-deriving
+        set_args etc.
+        """
         cfg = helm_repo(self._spec.repo_key)
         set_args: list[str] = []
         for k, v in _flatten(cfg.get("values_overrides", {})):
@@ -168,17 +227,22 @@ class HelmAppInstaller:
         for k, v in self._spec.extra_set:
             set_args += ["--set", f"{k}={v}"]
 
-        cmd_parts: list[str] = [
-            "helm", "upgrade", "--install", self._spec.release, f"'{chart.path}'",
+        # argv form: what install() will pass to subprocess.run.
+        argv: list[str] = [
+            "helm", "upgrade", "--install", self._spec.release, str(chart.path),
         ]
+        for vf in self._spec.values_files:
+            argv += ["--values", vf]
         if self._spec.create_namespace:
-            cmd_parts += ["--namespace", self._spec.namespace, "--create-namespace"]
+            argv += ["--namespace", self._spec.namespace, "--create-namespace"]
         else:
-            cmd_parts += ["--namespace", self._spec.namespace]
+            argv += ["--namespace", self._spec.namespace]
         if self._spec.wait:
-            cmd_parts.append("--wait")
-        cmd_parts += set_args
-        cmd = " ".join(cmd_parts)
+            argv.append("--wait")
+        argv += set_args
+
+        # Human-readable form: same argv but quoted for shell echo.
+        cmd = " ".join(argv)
 
         self._log.ok(f"{self._spec.release} chart cached at: {chart.path}")
         self._log.info(f"To install {self._spec.release} into the cluster, run manually:")
@@ -191,6 +255,34 @@ class HelmAppInstaller:
             helm_command=cmd,
             extra_user_steps=tuple(self.user_handoff_steps()),
         )
+
+    def _argv_for_install(self, result: AppPrepResult) -> list[str]:
+        """Build the argv list for `helm upgrade --install` from an AppPrepResult.
+
+        This mirrors _build_result's cmd construction but with values_files
+        expanded into --values flags. We split the call so install() can
+        reuse the same command-construction logic as prepare().
+        """
+        cfg = helm_repo(self._spec.repo_key)
+        set_args: list[str] = []
+        for k, v in _flatten(cfg.get("values_overrides", {})):
+            set_args += ["--set", f"{k}={v}"]
+        for k, v in self._spec.extra_set:
+            set_args += ["--set", f"{k}={v}"]
+
+        argv: list[str] = [
+            "helm", "upgrade", "--install", self._spec.release, str(result.chart_path),
+        ]
+        for vf in self._spec.values_files:
+            argv += ["--values", vf]
+        if self._spec.create_namespace:
+            argv += ["--namespace", self._spec.namespace, "--create-namespace"]
+        else:
+            argv += ["--namespace", self._spec.namespace]
+        if self._spec.wait:
+            argv.append("--wait")
+        argv += set_args
+        return argv
 
 
 # ---------- factory ----------
@@ -205,12 +297,21 @@ def installer_for(
 ) -> HelmAppInstaller:
     """Build the right installer for a repo_key.
 
-    Today only Headlamp is supported. Future keys (e.g. `gitlab`,
-    `traefik`) are matched here — callers (`app.py`) never special-case
-    the app name.
+    Each branch picks the subclass that has the right overrides for that
+    app (URL discovery, secret bootstrap, registration-token fetch, etc.).
+    Callers (`app.py`, `phase2/pipeline.py`) never special-case the app
+    name; the factory is the single place where repo_key → class lives.
     """
     if repo_key == "headlamp":
         return HeadlampInstaller(runner, paths, cache, log)
+    if repo_key == "traefik":
+        return TraefikInstaller(runner, paths, cache, log)
+    if repo_key == "openbao":
+        return OpenBaoInstaller(runner, paths, cache, log)
+    if repo_key == "gitlab":
+        return GitlabInstaller(runner, paths, cache, log)
+    if repo_key == "gitlab-runner":
+        return GitLabRunnerInstaller(runner, paths, cache, log)
     # Fallback: generic installer with sensible defaults. Subclasses can
     # add more cases above this line as they ship.
     return HelmAppInstaller(

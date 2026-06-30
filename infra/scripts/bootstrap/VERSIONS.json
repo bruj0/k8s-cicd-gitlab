@@ -38,6 +38,75 @@
       "values_overrides": {
         "service": { "type": "NodePort" }
       }
+    },
+    "traefik": {
+      "name": "traefik",
+      "url": "https://traefik.github.io/charts",
+      "chart": "traefik",
+      "chart_version": "36.4.0",
+      "values_overrides": {
+        "ports": {
+          "web": { "redirectTo": "websecure" }
+        },
+        "providers": {
+          "kubernetesGateway": { "enabled": true }
+        },
+        "ingressClass": {
+          "enabled": false
+        }
+      }
+    },
+    "openbao": {
+      "name": "openbao",
+      "url": "https://openbao.github.io/openbao-helm",
+      "chart": "openbao",
+      "chart_version": "0.10.1",
+      "values_overrides": {
+        "server": {
+          "ha": { "enabled": false, "replicas": 1 },
+          "audit": { "enabled": false },
+          "ui": { "enabled": true }
+        }
+      }
+    },
+    "gitlab": {
+      "name": "gitlab",
+      "url": "https://gitlab.gitlab.io/charts",
+      "chart": "gitlab",
+      "chart_version": "8.10.0",
+      "values_overrides": {
+        "global": {
+          "edition": "ce",
+          "hosts": {
+            "domain": "local.bruj0.net",
+            "externalIP": "127.0.0.1",
+            "https": true
+          },
+          "ingress": { "enabled": false },
+          "gateway": { "enabled": false },
+          "appConfig": {
+            "secretBackend": {
+              "type": "kubernetes",
+              "kubernetes": { "secretName": "gitlab-secret-backend" }
+            }
+          }
+        }
+      }
+    },
+    "gitlab-runner": {
+      "name": "gitlab-runner",
+      "url": "https://charts.gitlab.io",
+      "chart": "gitlab-runner",
+      "chart_version": "0.71.0",
+      "values_overrides": {
+        "gitlabUrl": "https://gitlab.local.bruj0.net",
+        "runners": {
+          "executor": "kubernetes",
+          "kubernetes": {
+            "namespace": "gitlab-runner"
+          }
+        }
+      }
     }
   }
 }

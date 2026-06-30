@@ -1,20 +1,29 @@
 """Composition root for the bootstrap package.
 
-Per spec rule, this is a *preparation* tool, not an execution tool:
+Phases:
+  1. Bootstrap checks the host for required tools, provisions the working
+     tree (tfvars, PKI, helm chart cache), and PRINTS the next commands.
+     It never invokes `tofu apply`. (See `spec.md` rule: "The bootstrap
+     application checks the system and provisions all the configuration
+     so a person can run it.")
 
-  1. Bootstrap checks the host for required tools.
-  2. Bootstrap provisions the working tree (tfvars, PKI, helm chart cache).
-  3. Bootstrap prints the exact next commands the user runs.
-
-It never invokes `tofu apply`, `helm install`, or `kubectl apply`.
+  2. Bootstrap ACTUALLY installs Phase 2 (Traefik + OpenBao + GitLab +
+     Runner + Gateway API manifests). The spec rule from Phase 1 was
+     scoped to OpenTofu; helm/kubectl ARE applied by the bootstrap so
+     iteration can test results. Every step is idempotent so re-runs are
+     safe.
 
 Run vs read at a glance:
 
     [bootstrap]  checks host prereqs, installs missing tools, mints PKI,
                  seeds tfvars, runs `tofu init` + `tofu validate`,
-                 caches the Headlamp chart, then STOPS.
+                 caches the Headlamp chart, then STOPS (Phase 1).
     [user]       inspects `tofu plan`, runs `tofu apply`, runs
-                 `kubectl get nodes`, runs `helm install` for Headlamp.
+                 `kubectl get nodes`, runs `helm install` for Headlamp
+                 (Phase 1's user handoff).
+    [bootstrap]  installs Traefik + OpenBao + GitLab + Runner + Gateway
+                 in order, with idempotency probes + retry-safe steps
+                 (Phase 2).
 
 Every line printed by this app is prefixed `[bootstrap]` or `[user]`
 so the boundary between the two is unambiguous in the terminal.
@@ -32,6 +41,10 @@ from .installer import installer_for
 from .logger import ConsoleLogger, Logger
 from .os_detect import detect_os, is_supported
 from .paths import Paths
+from .phase2 import (
+    GatewayApplier, OpenBaoClient, Phase2Installers, Phase2Pipeline,
+    WildcardCertInstaller,
+)
 from .pki import PkiRunner
 from .prereq import PrereqRegistry
 from .shell import CommandRunner, DryRunRunner, SubprocessRunner
@@ -57,12 +70,17 @@ class CliArgs:
 def parse_args(argv: list[str] | None = None) -> CliArgs:
     ap = argparse.ArgumentParser(
         description=(
-            "Phase 1 bootstrap. Provisions configuration (prereqs, PKI, "
-            "tfvars, helm chart cache) so a person can run `tofu apply` "
-            "themselves. Per spec, bootstrap never runs OpenTofu."
+            "Blueprint bootstrap. Phase 1 prepares the working tree (prereqs, "
+            "PKI, tfvars, helm chart cache) and prints the next commands. "
+            "Phase 2 installs GitLab + Runner + OpenBao + Traefik end-to-end. "
+            "Per spec, Phase 1 bootstrap never runs OpenTofu."
         )
     )
-    ap.add_argument("--phase", type=int, default=1, help="Which phase to run (only 1 supported today).")
+    ap.add_argument(
+        "--phase", type=int, default=1,
+        help="Which phase to run. 1 = prepare kind cluster (default). "
+             "2 = install GitLab stack end-to-end.",
+    )
     ap.add_argument("--domain", default="local.bruj0.net", help="Base DNS domain for the cluster.")
     ap.add_argument("--check", action="store_true", help="Only check prereqs; do not install or provision.")
     ap.add_argument("--skip-install", action="store_true", help="Assume prereqs are present; only check.")
@@ -71,9 +89,10 @@ def parse_args(argv: list[str] | None = None) -> CliArgs:
         "--user",
         action="store_true",
         help=(
-            "Only print the user-handoff block: the commands YOU must run after "
-            "bootstrap finishes (tofu plan / apply, kubectl verify, helm install, "
-            "discover Headlamp URL, mint login token). Useful as a cheat sheet."
+            "Only print the Phase-1 user-handoff block: the commands YOU "
+            "must run after bootstrap finishes (tofu plan / apply, kubectl "
+            "verify, helm install, discover Headlamp URL, mint login "
+            "token). Useful as a cheat sheet. (Phase 1 only.)"
         ),
     )
     ns = ap.parse_args(argv)
@@ -101,6 +120,11 @@ class BootstrapApp:
 
     The `--user` flag short-circuits the pipeline and only prints the
     user-handoff block — useful as a cheat sheet after the prep is done.
+
+    Phase 2 mode (`--phase 2`) wires a different pipeline (`Phase2Pipeline`)
+    that ACTUALLY installs the GitLab stack. Every step has its own
+    idempotency probe, so re-runs are safe and converge on a working
+    install after iteration.
     """
 
     def __init__(self, paths: Paths, args: CliArgs, log: Logger, runner: CommandRunner) -> None:
@@ -109,11 +133,39 @@ class BootstrapApp:
         self.log = log
         self.runner = runner
 
+        # Phase 1 collaborators.
         self.prereqs = PrereqRegistry.default(runner)
         self.pki = PkiRunner(runner, paths)
         self.tofu = TofuRunner(runner, paths, log)
         self.chart_cache = HelmChartCache(runner, paths, log)
         self.headlamp = HeadlampInstaller(runner, paths, self.chart_cache, log)
+
+        # Phase 2 collaborators. We construct them eagerly so a misconfig
+        # (e.g. missing references YAML) surfaces at boot, not at install.
+        # Note: we build the Phase 2 installers directly rather than via
+        # `installer_for()` because GitLab + Runner need an OpenBaoClient
+        # injected, which `installer_for()` doesn't know about.
+        from .phase2.gitlab import GitlabInstaller
+        from .phase2.openbao import OpenBaoInstaller
+        from .phase2.runner import GitLabRunnerInstaller
+        from .phase2.traefik import TraefikInstaller
+
+        self._phase2_openbao_client = OpenBaoClient(runner, paths, log)
+        self._phase2_cert = WildcardCertInstaller(runner, paths, log)
+        self._phase2_gateway = GatewayApplier(runner, paths, log)
+        self._phase2_installers = Phase2Installers(
+            cert=self._phase2_cert,
+            traefik=TraefikInstaller(runner, paths, self.chart_cache, log),
+            openbao=OpenBaoInstaller(runner, paths, self.chart_cache, log),
+            gitlab=GitlabInstaller(runner, paths, self.chart_cache, log, self._phase2_openbao_client),
+            runner=GitLabRunnerInstaller(runner, paths, self.chart_cache, log, self._phase2_openbao_client),
+        )
+        self.phase2 = Phase2Pipeline(
+            paths=paths, runner=runner, log=log,
+            installers=self._phase2_installers,
+            gateway=self._phase2_gateway,
+            cert=self._phase2_cert,
+        )
 
     @classmethod
     def from_argv(cls, bootstrap_dir, argv: list[str] | None = None) -> "BootstrapApp":
@@ -165,6 +217,17 @@ class BootstrapApp:
 
     def run(self) -> int:
         args = self.args
+
+        if args.phase == 1:
+            return self._run_phase1()
+        if args.phase == 2:
+            return self._run_phase2()
+        self._app_err(f"Phase {args.phase} is not implemented yet.")
+        return 2
+
+    def _run_phase1(self) -> int:
+        """The original Phase 1 preparation pipeline (pre-check + print handoff)."""
+        args = self.args
         family, distro = detect_os()
 
         self._banner("Phase 1 bootstrap — preparation only (no `tofu apply`)")
@@ -174,8 +237,6 @@ class BootstrapApp:
         self._app(f"Mode:           {mode}")
 
         if args.user:
-            # --user is a print-only cheat sheet: skip every side-effecting step.
-            # No "this app will:" preamble because nothing happens.
             self.log.info("")
             self._app("--user: skipping all prep, only printing the handoff commands.")
         else:
@@ -191,11 +252,6 @@ class BootstrapApp:
             self._app_err(f"Unsupported OS family: {family!r}. Install tools manually and re-run with --skip-install.")
             return 1
 
-        if args.phase != 1:
-            self._app_err(f"Phase {args.phase} is not implemented yet.")
-            return 2
-
-        # --user is a print-only cheat sheet: skip every side-effecting step.
         if args.user:
             self._banner("[user] Handoff cheat sheet (no prep was performed)")
             self._print_user_handoff_only()
@@ -239,6 +295,51 @@ class BootstrapApp:
         # Step 5: hand off to the user.
         self._print_user_handoff(headlamp)
         return 0
+
+    def _run_phase2(self) -> int:
+        """Phase 2: install GitLab stack end-to-end.
+
+        Different lifecycle from Phase 1: there's no user handoff, just a
+        final "Phase 2 install complete" with URLs and next commands.
+        Every step has an idempotency probe, so re-runs are safe.
+        """
+        args = self.args
+        family, distro = detect_os()
+
+        self._banner("Phase 2 bootstrap — install GitLab + Runner + OpenBao + Traefik")
+        self._app(f"Blueprint root: {self.paths.blueprint_dir}")
+        self._app(f"OS family:      {family}{f' ({distro})' if distro else ''}")
+        mode = self._describe_mode(args)
+        self._app(f"Mode:           {mode}")
+
+        if args.check:
+            self._app("--check: pre-flight only (no installs, no chart downloads)")
+        else:
+            self._app("This will:")
+            self._app("    1. pre-flight (cluster reachable, helm installed)")
+            self._app("    2. publish the Phase-1 wildcard TLS cert into gitlab+openbao namespaces")
+            self._app("    3. install Traefik with Gateway API CRDs")
+            self._app("    4. install + initialise + unseal OpenBao")
+            self._app("    5. apply Gateway + HTTPRoute manifests")
+            self._app("    6. install GitLab (min config) + capture initial creds into OpenBao")
+            self._app("    7. install GitLab Runner (registers against gitlab.local.bruj0.net)")
+        self.log.info("")
+
+        if args.user:
+            self._app_err("--user is Phase-1-only; ignored in Phase 2.")
+            return 2
+
+        if args.check:
+            # Pre-flight only — defer to the pipeline's pre-flight step.
+            try:
+                self.phase2._step_preflight()
+                self._app("Pre-flight OK.")
+                return 0
+            except Exception as e:
+                self._app_err(f"Pre-flight failed: {e}")
+                return 1
+
+        return self.phase2.run()
 
     def _print_user_handoff_only(self) -> None:
         """Cheat-sheet variant: prints the handoff using canned commands.

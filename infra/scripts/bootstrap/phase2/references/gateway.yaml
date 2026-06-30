@@ -1,0 +1,42 @@
+# Gateway API resources for *.local.bruj0.net routing.
+#
+# `GatewayClass` is created automatically by Traefik's chart when the
+# Gateway API provider is enabled. We don't redeclare it here.
+#
+# The `Gateway` listens on Traefik's HTTPS port (8443 on the cluster
+# network) and references the TLS Secret we publish in
+# phase2/cert.py:WildcardCertInstaller.
+#
+# HTTPRoutes for individual services (gitlab, openbao) live in
+# httproute-gitlab.yaml and httproute-openbao.yaml.
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: local-bruj0-net
+  namespace: traefik
+  labels:
+    app.kubernetes.io/name: local-bruj0-net
+    app.kubernetes.io/part-of: blueprint-phase2
+spec:
+  # Traefik registers itself as this GatewayClass when the chart's
+  # Gateway API provider is enabled. The name matches the chart's default.
+  gatewayClassName: traefik
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 8443
+      tls:
+        # Secret in the `gitlab` namespace — same wildcard cert is also
+        # published in `openbao` by WildcardCertInstaller.
+        certificateRefs:
+          - name: local-bruj0-net-tls
+            namespace: gitlab
+        # Modern TLS only — Phase 1's CA is self-signed but it's still
+        # an RSA-2048+ cert, so we can require >= 1.2.
+        parametersRef: null
+        options: {}
+        mode: Terminate
+      allowedRoutes:
+        namespaces:
+          from: All   # any namespace can attach a Route to this Gateway

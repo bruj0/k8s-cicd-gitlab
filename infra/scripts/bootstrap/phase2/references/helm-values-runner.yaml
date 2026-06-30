@@ -1,0 +1,42 @@
+# GitLab Runner values for Phase 2.
+#
+# Single runner, Kubernetes executor, registers against the GitLab
+# instance via a registration token fetched from OpenBao.
+#
+# The registration token is supplied at install-time via
+# --set runnerToken=... (see phase2/runner.py:install).
+
+# The chart's own release name is `gitlab-runner` (matches the namespace).
+# Use the Kubernetes executor so each CI job runs in its own pod.
+
+runners:
+  executor: kubernetes
+  config: |
+    [[runners]]
+      [runners.kubernetes]
+        namespace = "gitlab-runner"
+        image = "alpine:latest"
+      [runners.cache]
+        Type = "local"
+        [runners.cache.local]
+          path = "/tmp"
+
+# Resource limits for runner pods (each job). Iteration 2: tune for
+# the actual workload (Go builds need more memory, etc.).
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# We don't want the runner to create its own ServiceAccount — the
+# chart's default already gives it one with the right RBAC.
+rbac:
+  create: true
+
+# Don't auto-register tags — leave it to the runner config to advertise
+# itself generically. Iteration 2: add tags here once we know the job
+# labels the apps use.
+tags: ""

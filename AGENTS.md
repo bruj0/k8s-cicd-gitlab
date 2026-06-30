@@ -15,14 +15,20 @@ phases.
 
 A reproducible, **fully local** GitLab + Kubernetes CI/CD stack built
 on top of the `devops-take-home.md` assignment. It currently delivers
-**Phase 1 only**: a 5-node `kind` cluster provisioned by OpenTofu, with
-per-node and shared hostPath mounts, a self-signed wildcard cert for
-`*.local.bruj0.net`, and a Headlamp dashboard chart pre-cached for the
-user to install.
+**Phase 1 (cluster)** and **Phase 2 (GitLab stack)**:
 
-Phases 2 and 3 (GitLab, Runner, OpenBao, Traefik, app + CI) are
-**planned but not implemented** — see the "Phases" table in
-`README.md` for status.
+- **Phase 1**: 5-node `kind` cluster provisioned by OpenTofu, with
+  per-node and shared hostPath mounts, a self-signed wildcard cert for
+  `*.local.bruj0.net`, and a Headlamp dashboard chart pre-cached for
+  the user to install.
+- **Phase 2**: GitLab CE + Runner + OpenBao + Traefik (with Gateway API)
+  installed end-to-end into the Phase-1 cluster via
+  `bootstrap.py --phase 2`. Secrets bootstrap goes through OpenBao;
+  TLS termination is handled by Traefik's Gateway. Iteration happens
+  via `.agents/skills/provision-gitlab/SKILL.md`.
+
+Phase 3 (Helm-deployed app, CI pipeline, secret-injection via OpenBao)
+is planned but not implemented.
 
 ### What "local" means here
 
@@ -46,6 +52,8 @@ derives from them.
 | [`docs/phase-1.md`](docs/phase-1.md) | Phase 1 runbook with manual step-by-step. |
 | [`docs/prereqs.md`](docs/prereqs.md) | Supported OSes, hardware floor, ports, DNS. |
 | `infra/scripts/bootstrap/VERSIONS.json` | **Sole source of truth** for every pinned version (tools, helm chart, helm repo URLs). Read it before adding any new tool or chart. |
+| `.agents/skills/provision-gitlab/SKILL.md` | The Phase-2 iteration loop (run, observe, fix, repeat). Drives how an AI agent should use `bootstrap.py --phase 2`. |
+| `infra/scripts/bootstrap/phase2/references/*.yaml` | The Phase-2 install-time configuration (helm values + Gateway API manifests). Single source of truth for what Phase-2 ships; every installer reads from here. |
 
 If anything else disagrees with these, **the table wins**.
 
@@ -57,6 +65,10 @@ If anything else disagrees with these, **the table wins**.
 blueprint/
 ├── AGENTS.md                            # this file
 ├── README.md
+├── .agents/
+│   └── skills/
+│       └── provision-gitlab/
+│           └── SKILL.md                 # Phase-2 iteration loop
 ├── .gitignore                           # tls/private, tofu state, *.tfvars, .terraform
 ├── apps/                                # repositories to host in GitLab (Phase 3)
 │   ├── guestbook/                       # demo: classic k8s guestbook (Go app + helm chart)
@@ -93,6 +105,26 @@ blueprint/
     │       ├── tofu.py                  # TofuRunner (init / validate / next_steps; NO apply)
     │       ├── helm_cache.py            # HelmChartCache (downloads <name>-<ver>.tgz to infra/helm-charts/)
     │       └── app_installer.py         # HelmAppInstaller generic + HeadlampInstaller subclass + installer_for() factory
+    │       └── phase2/                  # Phase 2: install GitLab + Runner + OpenBao + Traefik
+    │           ├── __init__.py          # re-exports Phase2Pipeline + installers
+    │           ├── pipeline.py          # 7-step orchestrator (called from app.py:BootstrapApp)
+    │           ├── catalog.py           # Phase2Installers dataclass (bundle of every installer)
+    │           ├── cert.py              # WildcardCertInstaller — republishes Phase-1 wildcard cert
+    │           ├── traefik.py           # TraefikInstaller — reverse proxy with Gateway API
+    │           ├── openbao.py           # OpenBaoInstaller — chart install + init/unseal
+    │           ├── secrets.py           # OpenBaoClient — `kubectl exec ... bao ...` wrapper
+    │           ├── gitlab.py            # GitlabInstaller — chart + post-install secret capture
+    │           ├── runner.py            # GitLabRunnerInstaller — registers against gitlab.local.bruj0.net
+    │           ├── gateway.py           # GatewayApplier — kubectl apply for Gateway + HTTPRoute YAMLs
+    │           └── references/          # install-time YAML (committed, see spec rule "templates must have their own files")
+    │               ├── helm-values-traefik.yaml
+    │               ├── helm-values-openbao.yaml
+    │               ├── helm-values-gitlab.yaml
+    │               ├── helm-values-runner.yaml
+    │               ├── gateway.yaml             # GatewayClass + Gateway for *.local.bruj0.net
+    │               ├── httproute-gitlab.yaml     # gitlab.local.bruj0.net → gitlab-webservice
+    │               └── httproute-openbao.yaml    # openbao.local.bruj0.net → openbao-ui
+    ├── secrets/                         # gitignored: OpenBao init JSON (mode 0700, see phase2/openbao.py)
     ├── tofu/                            # OpenTofu configuration
     │   ├── providers.tf                 # kind ~> 0.11, helm ~> 3.0, local ~> 2.5, null ~> 3.2
     │   ├── variables.tf                 # cluster_name, kubernetes_version, node_shapes, kubeconfig_path, data_root, domain
@@ -213,236 +245,69 @@ real work happens from the printed commands onward).
 1. Edit `bootstrap/VERSIONS.json` — add an entry under
    `helm_repositories` with `name`, `url`, `chart`, `chart_version`,
    and optional `values_overrides`.
-2. If the chart's installer is non-trivial (e.g. it needs a custom
-   release name, a custom namespace, or post-install steps like URL
-   discovery or token mint), add a new subclass of `HelmAppInstaller`
-   in `bootstrap/app_installer.py` that overrides `user_handoff_steps()`,
-   then add a branch to `installer_for()` so `repo_key` resolves to it.
+2. Decide which file the installer lives in:
+   - **Phase 1 installers (one-line, no post-install steps)** live in
+     `bootstrap/app_installer.py`. The example in the old version of
+     this section (`GitlabInstaller` reading a K8s Secret) was the
+     pre-Phase-2 shape. Phase 1 installers inherit the base
+     `HelmAppInstaller.install()` and only override `user_handoff_steps()`.
+   - **Phase 2+ installers (need init, post-install secret capture,
+     registration-token fetch, etc.)** live in
+     `bootstrap/phase2/<component>.py` and get their own `install()`
+     override. The composition root in `app.py:BootstrapApp.__init__`
+     builds these directly via the relevant class, passing in any
+     collaborators (e.g. `OpenBaoClient` for GitLab / Runner).
+   - In both cases, add a branch to `installer_for()` in
+     `app_installer.py` so `repo_key` resolves to the right class.
+     Phase 2 also updates the `Phase2Installers` dataclass in
+     `bootstrap/phase2/catalog.py`.
 
-Example: adding a `GitlabInstaller` that exposes the initial root password:
+Example for a new Phase-2-style installer (Vault with auto-unseal):
 
 ```python
-# in app_installer.py
-class GitlabInstaller(HelmAppInstaller):
-    REPO_KEY = "gitlab"
+# in bootstrap/phase2/vault.py
+class VaultInstaller(HelmAppInstaller):
+    REPO_KEY = "vault"
 
-    def __init__(self, runner, paths, cache, log):
+    def __init__(self, runner, paths, cache, log, openbao):
         super().__init__(runner, paths, cache, log,
                          HelmAppSpec(repo_key=self.REPO_KEY,
-                                     release="gitlab",
-                                     namespace="gitlab"))
+                                     release="vault",
+                                     namespace="vault",
+                                     values_files=(str(paths.phase2_refs_dir
+                                                       / "helm-values-vault.yaml"),)))
+        self._openbao = openbao
 
-    def user_handoff_steps(self) -> list[UserStep]:
-        return [UserStep(
-            title="Read the initial root password (one-time, then change it):",
-            lines=(
-                f"export KUBECONFIG={self._paths.tofu_dir}/kubeconfig",
-                "kubectl get secret gitlab-gitlab-initial-root-password "
-                "-n gitlab -o jsonpath=\"{.data.password}\" | base64 --decode",
-            ),
-        )]
+    def install(self):
+        result = super().install()
+        # post-install: enable kubernetes auth method via bao CLI
+        # (delegated to OpenBaoClient, etc.)
+        return result
 
-# in installer_for():
-if repo_key == "headlamp":
-    return HeadlampInstaller(...)
-if repo_key == "gitlab":
-    return GitlabInstaller(runner, paths, cache, log)
-# ...
+# in bootstrap/phase2/catalog.py:
+@dataclass(frozen=True)
+class Phase2Installers:
+    cert: WildcardCertInstaller
+    traefik: TraefikInstaller
+    openbao: OpenBaoInstaller
+    gitlab: GitlabInstaller
+    runner: GitLabRunnerInstaller
+    vault: VaultInstaller                  # ← add
+
+# in app.py:BootstrapApp.__init__:
+self._phase2_installers = Phase2Installers(
+    cert=self._phase2_cert,
+    traefik=TraefikInstaller(...),
+    openbao=OpenBaoInstaller(...),
+    gitlab=GitlabInstaller(..., self._phase2_openbao_client),
+    runner=GitLabRunnerInstaller(..., self._phase2_openbao_client),
+    vault=VaultInstaller(..., self._phase2_openbao_client),
+)
 ```
 
-Wire it into `BootstrapApp.__init__` (or iterate over multiple
-installers if Phase 2 has more than one) and call `.prepare()` from
-`app.run()`. The `--user` cheat-sheet will pick up the new
-`user_handoff_steps()` automatically.
-
-### Adding a new node to the cluster
-
-Edit `infra/tofu/tofu.tfvars` (create from `.example` if missing) and
-extend `node_shapes` with a new entry:
-
-```hcl
-node_shapes = [
-  # existing entries
-  { name = "worker-extra", role = "gitlab", memory = "4Gi", cpu = 2, node_index = 6 },
-]
-```
-
-Then either:
-
-- **Use an existing `data/nodeN/` directory** (preferred — the spec
-  reserves `node1..node5`). If you add `node_index = 5` for the extra
-  worker, the control-plane's existing `node5` mount is skipped because
-  control-plane nodes don't get a per-node bind (see
-  `infra/tofu/locals.tf:node_mount_host`).
-- **Create a new `data/nodeN/` directory** if you genuinely need more
-  than 5 worker slots.
-
-Do not touch `infra/tofu/variables.tf` defaults — those are spec
-values; local overrides go in `tofu.tfvars`.
-
-### Changing a pinned version
-
-Edit `bootstrap/VERSIONS.json`. Then:
-
-- `tofu -chdir=infra/tofu init -upgrade` (already run by bootstrap).
-- `helm repo update` (already run by bootstrap when it caches charts).
-
-### Adding a new phase
-
-Read `spec.md` for the phase definition. Create:
-
-- `docs/phase-N.md` — the runbook.
-- A new section in `README.md` "Phases" table.
-- Add `--phase N` handling in `bootstrap/app.py:parse_args()` and
-  `BootstrapApp.run()`.
-
-### Refactoring `pki.py` to read templates from disk
-
-`infra/scripts/pki.py` writes inline openssl cnf strings via
-`write_openssl_cnf()`. The `spec.md` rule says *"No hardcoded templates
-inside Python scripts, all templates must have their own files."*
-To fix: move the cnf bodies to `infra/scripts/bootstrap/templates/`
-(or somewhere similar) and have `pki.py` read them with a `format()`
-substitution. This is a known piece of debt; Phase 2 cleanup is the
-right time.
-
----
-
-## 7. Known debt / non-obvious gotchas
-
-These are things that bit us while building this. Read them before
-making changes — they're not obvious from the source alone.
-
-1. **The `data/` vs `infra/data/` mismatch.** The spec puts the
-   `nodeN/` hostPath dirs at `blueprint/data/` (which exists and is
-   empty). But `infra/tofu/variables.tf` defaults `data_root =
-   "../data"`, which from inside `infra/tofu/` resolves to
-   `infra/data/` — and that's where the actual `node1..node5/`
-   directories were created on first apply. The current behaviour is
-   *correct for what the kind cluster sees* (it binds
-   `infra/data/nodeN`), but the directory layout doesn't match the
-   spec's literal "blueprint/data/" placement.
-
-   **Fix on next refactor**: move the `infra/data/` contents up to
-   `blueprint/data/` and either change `data_root` default to
-   `../../data` (relative to `infra/tofu/`) or accept an absolute
-   path. Until then, the bootstrap instructions should mention
-   `infra/data/` as the live hostPath source.
-
-2. **kind RAM/CPU are advisory, not enforced.** `node_shapes.memory`
-   is documented and labels the node but kind does not actually limit
-   a container's memory inside Docker. Lower numbers in `tofu.tfvars`
-   are documentation only — if a node really does OOM, you'll see it
-   on the host, not inside kind.
-
-3. **`extra_port_mappings` only on the control-plane.** Originally
-   every node reserved host ports 80/443. Docker rejected the second
-   container that tried to claim `127.0.0.1:80`. We now bind only the
-   control-plane. If Phase 2's Traefik ends up on a dedicated worker,
-   move the `extra_port_mappings` block to that node.
-
-4. **No `kubectl` context is set in `~/.kube/config`.** The kind
-   kubeconfig is written side-by-side at `infra/tofu/kubeconfig`.
-   Reviewers must `export KUBECONFIG=$PWD/infra/tofu/kubeconfig` (or
-   use `--kubeconfig=...`). We deliberately don't mutate the host's
-   global kubeconfig — undoing a mutation is harder than exporting an
-   env var.
-
-5. **`terraform.tfstate` drift from cwd.** When this project moved
-   from `/mnt/data/Projects/k8s-cicd/blueprint/...` to
-   `/home/bruj0/projects/k8s-cicd/blueprint/...`, the state file's
-   absolute paths changed. OpenTofu handled it by reporting
-   "destroy and recreate" for the affected resources, but it didn't
-   actually delete the running cluster. If you ever see this:
-   `kind delete cluster --name <cluster_name>` first, then
-   `tofu apply`. Moving the project again will recreate the issue.
-
-6. **Headlamp chart version pinning.** The pin in `VERSIONS.json` is
-   `0.43.0`. The chart's repo URL changed upstream (older docs point
-   to `headlamp-k8s.github.io/headlamp/`, which 404s). The current
-   correct URL is `https://kubernetes-sigs.github.io/headlamp/`.
-   If you bump the chart and the URL breaks, double-check
-   `helm search repo headlamp` and update `VERSIONS.json` accordingly.
-
-7. **`helm --version` doesn't accept `--short` in helm 4.** The
-   `PrereqTool.check()` probe for helm is `["helm", "version"]` (not
-   `["helm", "version", "--short"]`). If you copy-paste a probe into
-   a new tool class, follow the existing `_PROBES` dict entries.
-
-8. **Bootstrap is intentionally non-idempotent at the `tofu.tfvars`
-   seed step.** `TofuRunner.seed_tfvars_if_missing()` copies
-   `tofu.tfvars.example` → `tofu.tfvars` only if the real file
-   doesn't exist. After that, the user owns the file. Don't add a
-   "diff and update" step — that's an OpenTofu's `apply` concern, not
-   bootstrap's.
-
-9. **`subdomain` rewriting for the kubeconfig.** `cluster.tf` rewrites
-   `server: https://127.0.0.1:<port>` to `server: https://localhost:<port>`
-   for ergonomics. This is purely a string `replace()` — if a future
-   kind provider version starts using IPv6 `::1` instead of `127.0.0.1`,
-   the second `replace()` line covers it but you should also verify
-   the rewritten kubeconfig still passes `kubectl --kubeconfig=... get nodes`.
-
----
-
-## 8. Quick verification commands
-
-Use these after any change to confirm nothing broke.
-
-```sh
-cd blueprint
-
-# 1. Package syntax check
-python3 -c "import ast,pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('infra/scripts/bootstrap').rglob('*.py')]"
-python3 -m py_compile infra/scripts/bootstrap.py
-
-# 2. Bootstrap dry-run (no infra change, no chart download)
-python3 infra/scripts/bootstrap.py --phase 1 --dry-run
-
-# 3. Bootstrap check mode (host prereqs only, no install, no apply)
-python3 infra/scripts/bootstrap.py --phase 1 --check --skip-install
-
-# 4. Tofu syntax check
-tofu -chdir=infra/tofu validate
-
-# 5. Tofu plan (idempotency — should report "No changes" on second run)
-tofu -chdir=infra/tofu plan
-
-# 6. Cluster liveness (assumes prior `tofu apply`)
-export KUBECONFIG=$PWD/infra/tofu/kubeconfig
-kubectl get nodes -o wide
-
-# 7. Verify the chart cache
-ls infra/helm-charts/
-
-# 8. Verify the PKI is fresh
-openssl x509 -in infra/tls/private/_.local.bruj0.net.crt -noout -subject -issuer -dates
-```
-
----
-
-## 9. Glossary
-
-- **Bootstrap**: `infra/scripts/bootstrap.py` + the `bootstrap/`
-  package. The user-facing preparation tool.
-- **Phase**: A numbered chunk of work in the spec (Phase 1 = kind
-  cluster, Phase 2 = GitLab + friends, Phase 3 = app + CI).
-- **Headlamp**: Kubernetes dashboard (`https://github.com/kubernetes-sigs/headlamp`).
-  Phase 1 pre-caches the chart but doesn't install it.
-- **Per-node mount / shared mount**: kind `extra_mounts` from
-  `data/nodeN/` → `/var/local/nodeN` (workers only) and
-  `data/shared/` → `/var/local/shared` (every node including
-  control-plane).
-- **Local CA**: Self-signed RSA-4096 root certificate generated by
-  `pki.py`. Lives under `infra/tls/private/ca.{crt,key}`. Phase 2
-  swaps this for cert-manager with a DNS-01 issuer once public DNS is
-  delegated.
-- **`*.local.bruj0.net`**: The wildcard domain every Phase 2 hostname
-  (gitlab, traefik, openbao) resolves under. Phase 1 issues the
-  wildcard cert but nothing serves on it yet.
-
----
-
-If something in this document is wrong, **fix it**. This file is the
-first thing an AI agent reads; staleness here will mislead every
-future change.
+Wire the new step into `bootstrap/phase2/pipeline.py:_step_*` and
+add a matching YAML reference under `references/`.
+````
+<userPrompt>
+Provide the fully rewritten file, incorporating the suggested code change. You must produce the complete file.
+</userPrompt>

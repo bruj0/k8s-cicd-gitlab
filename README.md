@@ -35,7 +35,7 @@ blueprint/
 | Phase | Status   | What it delivers                                                            |
 | ----- | -------- | --------------------------------------------------------------------------- |
 | 1     | ✅ done  | Local 5-node kind cluster provisioned by OpenTofu, per-node + shared mounts |
-| 2     | pending  | GitLab (minimal), Runner, OpenBao, Traefik w/ Gateway API, HTTPS for `gitlab.local.bruj0.net` |
+| 2     | ✅ done  | GitLab (minimal) + Runner + OpenBao + Traefik w/ Gateway API, reachable at `https://gitlab.local.bruj0.net` |
 | 3     | pending  | Helm-deployed app, CI pipeline, secret-injection via OpenBao               |
 
 See [docs/phase-1.md](docs/phase-1.md) for the Phase 1 runbook.
@@ -104,6 +104,35 @@ python3 infra/scripts/bootstrap.py --user
 
 See [docs/prereqs.md](docs/prereqs.md) for host requirements and
 [docs/phase-1.md](docs/phase-1.md) for the detailed Phase 1 runbook.
+
+## Quick start (Phase 2)
+
+After Phase 1 has you at `kubectl get nodes` showing 5 nodes Ready,
+install the GitLab stack on top:
+
+```sh
+cd blueprint
+export KUBECONFIG=$PWD/infra/tofu/kubeconfig
+
+# Optional: pre-flight check (no installs, just verifies cluster + helm).
+python3 infra/scripts/bootstrap.py --phase 2 --check
+
+# Install everything (Traefik, OpenBao, GitLab, Runner, Gateway + HTTPRoutes).
+python3 infra/scripts/bootstrap.py --phase 2
+
+# Trust the local CA so curl / your browser accept the self-signed cert.
+sudo trust anchor infra/tls/public/ca.crt
+
+# Open GitLab: https://gitlab.local.bruj0.net  (login: root)
+# Open OpenBao: https://openbao.local.bruj0.net  (initial root token in
+#   infra/secrets/openbao-init.json, gitignored, chmod 600)
+```
+
+Phase 2 runs the 7-step pipeline end-to-end. Every step is idempotent —
+**re-runs are safe**. If a step fails, fix the corresponding installer
+or YAML reference under `infra/scripts/bootstrap/phase2/` and re-run.
+The iteration loop is documented at
+[`.agents/skills/provision-gitlab/SKILL.md`](.agents/skills/provision-gitlab/SKILL.md).
 
 ## Conventions
 

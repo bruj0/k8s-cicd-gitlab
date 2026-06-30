@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .logger import Logger
 from .paths import Paths
-from .shell import CommandRunner
+from .shell import CommandRunner, DryRunRunner
 from .versions import helm_repo
 
 
@@ -72,11 +72,19 @@ class HelmChartCache:
             "--version", version,
             "--destination", str(self._paths.helm_charts_dir),
         ])
-        if not target.exists():
-            # `helm pull` writes <filename>.tgz; some chart versions use a different
-            # suffix. Fall back: take the newest .tgz in the charts dir.
-            candidates = sorted(self._paths.helm_charts_dir.glob(f"{name}-*.tgz"), key=lambda p: p.stat().st_mtime)
-            if not candidates:
-                raise RuntimeError(f"helm pull succeeded but {name} tgz not found in {self._paths.helm_charts_dir}")
+        if target.exists():
+            return CachedChart(name, version, target)
+        # `helm pull` writes .tgz; some chart versions use a different
+        # suffix. Fall back: take the newest .tgz in the charts dir.
+        candidates = sorted(self._paths.helm_charts_dir.glob(f"{name}-*.tgz"), key=lambda p: p.stat().st_mtime)
+        if candidates:
             return CachedChart(name, version, candidates[-1])
-        return CachedChart(name, version, target)
+        # No candidate. This happens in dry-run (helm pull didn't actually
+        # write anything) AND in real runs when the chart version string
+        # is malformed. Distinguish the two: dry-run returns a synthetic
+        # path so callers can still build the install command for preview;
+        # a real run raises.
+        if isinstance(self._r, DryRunRunner):
+            self._log.info(f"[dry-run] no chart on disk; returning synthetic path for {name}@{version}")
+            return CachedChart(name, version, target)
+        raise RuntimeError(f"helm pull succeeded but {name} tgz not found in {self._paths.helm_charts_dir}")

@@ -15,6 +15,11 @@ infra/tofu/.last_smoke.json
 # Generated kubeconfig (contains client cert + key base64-encoded inside)
 infra/tofu/kubeconfig
 
+# Phase 2 runtime secrets (OpenBao unseal key, GitLab init password, runner
+# registration token). The dir is created by `bootstrap.py --phase 2` with
+# mode 0700. NEVER commit these files.
+infra/secrets/
+
 # Environment files (typically hold tokens, secrets, hostnames)
 .env
 .env.*

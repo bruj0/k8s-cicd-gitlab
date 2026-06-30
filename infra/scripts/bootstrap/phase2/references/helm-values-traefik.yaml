@@ -1,0 +1,42 @@
+# Traefik values for the Phase 2 reverse proxy.
+#
+# Kept minimal: enable the Gateway API provider (the chart's own
+# `--set` flags above do the same, but values files are easier to diff
+# during the iteration loop).
+#
+# The GatewayClass is created by Traefik's chart automatically when the
+# Gateway provider is enabled. The Gateway + HTTPRoute resources in
+# gateway.yaml + httproute-*.yaml reference that GatewayClass.
+
+providers:
+  kubernetesGateway:
+    enabled: true
+  kubernetesIngress:
+    enabled: false   # we use Gateway API, not Ingress
+
+# Expose the dashboard on a non-public port for local port-forwarding.
+# Default: 9000. We pin it explicitly so the user handoff's
+# `kubectl port-forward` command is stable.
+service:
+  spec:
+    type: ClusterIP
+
+ports:
+  # Standard HTTP / HTTPS ports.
+  web:
+    port: 8000
+    expose: false
+    redirectTo: websecure
+  websecure:
+    port: 8443
+    expose: false
+  # Dashboard (port-forwarded to localhost:9000 by the user handoff).
+  traefik:
+    port: 9000
+    expose: false
+
+# Don't deploy a Dashboard ingress — Traefik chart's default behaviour
+# is to also create an Ingress for the dashboard. We don't want that.
+ingressRoute:
+  dashboard:
+    enabled: false

@@ -1,0 +1,70 @@
+# GitLab CE values for Phase 2 (minimal).
+#
+# Per spec: "Minimal configuration". In practice that means we accept
+# the chart's bundled Postgres/Redis/MinIO/Gitalia defaults but disable
+# the bundled Ingress — Traefik's Gateway API does the routing via the
+# httproute-gitlab.yaml manifest.
+#
+# Iteration note: GitLab's chart is heavy. If you OOM on a 4 GB worker,
+# bump the worker count via tofu.tfvars and re-run `tofu apply`. Or
+# set `global.postgresql.resources.requests.memory: 1Gi` etc. below.
+
+global:
+  edition: ce
+  hosts:
+    domain: local.bruj0.net
+    externalIP: 127.0.0.1
+    https: true
+  # Disable the chart's Ingress resource; we route via Gateway API.
+  ingress:
+    enabled: false
+  # The chart can also create a Gateway resource directly. Disable
+  # because we manage the Gateway ourselves in gateway.yaml.
+  gateway:
+    enabled: false
+  # We want GitLab to read its initial root password from a Kubernetes
+  # Secret (which the GitLab installer writes from OpenBao after install).
+  # In iteration-2 we'll switch this to `openbao` directly. For now,
+  # `kubernetes` is the simplest backend that satisfies the chart.
+  appConfig:
+    secretBackend:
+      type: kubernetes
+      kubernetes:
+        secretName: gitlab-secret-backend
+
+# Resource limits: keep everything small enough to fit on 3 workers
+# × 4 GB. Bump if OOM kills during install.
+# (Iteration 2: tune per-component. The defaults here are conservative
+# to keep the install green on the dev cluster.)
+
+postgresql:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+redis:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+minio:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+# Disable Prometheus monitoring (saves resources; iteration 2 can turn back on).
+prometheus:
+  install: false
+
+# Disable the bundled SSH service — we expose git over HTTPS only.
+ssh:
+  enabled: false

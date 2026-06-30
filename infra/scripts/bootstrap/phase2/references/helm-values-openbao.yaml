@@ -1,0 +1,47 @@
+# OpenBao values for Phase 2 (minimal: dev-mode single replica).
+#
+# Phase 1's RAM budget is tight (4-8 GB per worker). For Phase 2 we run
+# OpenBao as a single replica with HA disabled — enough to issue tokens
+# and store KV secrets, no Raft quorum needed. Production HA is out of
+# scope for the iteration loop.
+
+server:
+  # Single replica is enough for dev. To go HA later: set replicas: 3
+  # and configure `ha.enabled: true` + a Raft backend (the chart's
+  # default backend).
+  ha:
+    enabled: false
+    replicas: 1
+
+  # We init/unseal manually via `bao operator init` from inside the pod
+  # (see phase2/openbao.py:_init / _unseal). Disable the chart's auto-init
+  # so it doesn't fight us.
+  standalone:
+    enabled: true
+    logLevel: "info"
+
+  # Audit log: useful when debugging iteration-1 issues. Off by default.
+  audit:
+    enabled: false
+
+  # Enable the UI so we can browse KV at https://openbao.local.bruj0.net
+  ui:
+    enabled: true
+    serviceType: ClusterIP
+
+  # Resource limits — keep it small so the GitLab chart still fits.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Disable Injector for Phase 2 — we don't use Kubernetes auth method.
+injector:
+  enabled: false
+
+# Disable the CSI provider.
+csi:
+  enabled: false
