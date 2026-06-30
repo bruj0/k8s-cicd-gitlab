@@ -1,0 +1,5 @@
+Placeholder. See `data/node1/.gitkeep` for context.
+
+`node5/` exists but is unused by Phase 1's tofu config (which
+defines 1 control-plane + 4 workers). Reserved for Phase 2
+when GitLab gets a dedicated node.

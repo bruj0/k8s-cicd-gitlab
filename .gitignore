@@ -1,0 +1,35 @@
+# Local PKI: never commit private keys
+infra/tls/private/
+# Public side stays (cert only, no key) — keep public/ tracked
+
+# OpenTofu working files
+infra/tofu/.terraform/
+infra/tofu/.terraform.lock.hcl
+infra/tofu/terraform.tfstate
+infra/tofu/terraform.tfstate.backup
+# Local override of variables (use .example as the committed template)
+infra/tofu/*.tfvars
+!infra/tofu/*.tfvars.example
+# Smoke-test snapshot written by null_resource
+infra/tofu/.last_smoke.json
+# Generated kubeconfig (contains client cert + key base64-encoded inside)
+infra/tofu/kubeconfig
+
+# Environment files (typically hold tokens, secrets, hostnames)
+.env
+.env.*
+!.env.example
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+
+# Editor / OS scratch
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~

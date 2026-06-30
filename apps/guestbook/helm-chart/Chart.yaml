@@ -1,0 +1,28 @@
+apiVersion: v2
+name: guestbook
+description: A Helm chart for Kubernetes
+
+# A chart can be either an 'application' or a 'library' chart.
+type: application
+
+# This is the chart version. This version number should be incremented each time you make changes to the chart.
+version: 0.1.17
+
+annotations:
+  team: "Guestbook Team"
+  tags: "guestbook, go, redis"
+  componentManifest: "gitea-http.gitea.svc.cluster.local:3000/gitea_admin/appA.git"
+# This is the version number of the application being deployed. This version number should be incremented each time you make changes to the application.
+appVersion: "1.0"
+
+# dependencies:
+#   - name: subchart
+#     repository: http://localhost:10191
+#     version: 0.1.0
+#     import-values:
+#       - child: dev
+#         parent: dev
+#       - child: qa
+#         parent: qa
+#       - child: prod
+#         parent: prod

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta content="text/html; charset=utf-8" http-equiv="Content-Type">
+    <meta charset="utf-8">
+    <meta content="width=device-width" name="viewport">
+    <link href="style.css" rel="stylesheet">
+    <title>Welcome to my Guestbook</title>
+  </head>
+  <body>
+    <div id="header">
+      <h1>Welcome to my Guestbook <span id="my-version">v0.0.0</span></h1>
+      
+    </div>
+
+    <!-- Updated styling for environment-info to ensure it's centered -->
+    <div id="environment-info" style="
+      text-align: left; 
+      width: 60%; 
+      margin: 0 auto; 
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      max-width: 600px;
+      background-color: #f5f5f5;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    ">
+      <h2>Environment Values:</h2>
+      <span id="environment-variable1">Loading...</span>
+      <span id="environment-variable2">Loading...</span>
+      <span id="environment-variable3">Loading...</span>
+      <span id="environment-variable4">Loading...</span>
+    </div>
+
+    <div id="guestbook-entries">
+      <p>Waiting for database connection...</p>
+    </div>
+
+    <div>
+      <form id="guestbook-form">
+        <input autocomplete="off" id="guestbook-entry-content" type="text">
+        <a href="#" id="guestbook-submit">Submit</a>
+      </form>
+    </div>
+
+    <div>
+      <p><h2 id="guestbook-host-address"></h2></p>
+      <p><a href="env">/env</a>
+      <a href="info">/info</a></p>
+    </div>
+    <script src="//ajax.googleapis.com/ajax/libs/jquery/2.1.1/jquery.min.js"></script>
+    <script src="script.js"></script>
+  </body>
+</html>

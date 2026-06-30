@@ -1,0 +1,43 @@
+{
+  "tools": {
+    "docker": {
+      "version": ">=24.0",
+      "package_by_family": { "arch": "docker", "debian": "docker.io", "rhel": "docker", "darwin": "--cask docker" }
+    },
+    "kubectl": {
+      "version": ">=1.31.0",
+      "package_by_family": { "arch": "kubectl", "debian": "kubectl", "rhel": "kubectl", "darwin": "kubernetes-cli" }
+    },
+    "kind": {
+      "version": "v0.27.0",
+      "binary_url_linux_amd64": "https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64",
+      "package_by_family": { "arch": "kind", "debian": "kind", "rhel": "kind", "darwin": "kind" }
+    },
+    "helm": {
+      "version": ">=3.16.0",
+      "package_by_family": { "arch": "helm", "debian": "helm", "rhel": "helm", "darwin": "helm" }
+    },
+    "opentofu": {
+      "version": ">=1.6",
+      "package_by_family": { "arch": "opentofu", "debian": "opentofu", "rhel": "opentofu", "darwin": "opentofu" }
+    },
+    "openssl": {
+      "version": ">=3.0",
+      "package_by_family": { "arch": "openssl", "debian": "openssl", "rhel": "openssl", "darwin": "openssl@3" }
+    }
+  },
+  "kubernetes": {
+    "kindest_node_image": "kindest/node:v1.31.0"
+  },
+  "helm_repositories": {
+    "headlamp": {
+      "name": "headlamp",
+      "url": "https://kubernetes-sigs.github.io/headlamp/",
+      "chart": "headlamp",
+      "chart_version": "0.43.0",
+      "values_overrides": {
+        "service": { "type": "NodePort" }
+      }
+    }
+  }
+}
