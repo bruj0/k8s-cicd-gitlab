@@ -1,0 +1,65 @@
+[project]
+name = "blueprint-bootstrap"
+version = "0.1.0"
+description = "Bootstrap for the local GitLab + OpenBao kind-cluster blueprint."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "bruj0" },
+]
+keywords = ["bootstrap", "kubernetes", "gitlab", "openbao", "kind"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Installation/Setup",
+]
+
+dependencies = [
+    # OpenBao HTTP client (Vault-compatible API). Used for KV v2 +
+    # token auth. Lets the bootstrap talk to OpenBao over the same
+    # HTTP API the chart's pods use internally — no `kubectl exec
+    # bao` round-trips.
+    "hvac>=2.3.0,<3.0",
+    # CLI entry point (subcommands, --help formatting).
+    "click>=8.1.7,<9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyyaml>=6.0.1",  # used by the chart-lint tooling
+]
+
+[project.scripts]
+# `blueprint-bootstrap` becomes a real CLI on $PATH after
+# `uv sync`. Useful for `uv run blueprint-bootstrap --phase 2`.
+"blueprint-bootstrap" = "bootstrap.cli:main"
+# `blueprint-secrets` is the post-install helper: read secrets,
+# open the OpenBao UI. Both auto-port-forward 127.0.0.1:8200.
+"blueprint-secrets" = "bootstrap.secrets_cli:main"
+
+[project.urls]
+Homepage = "https://github.com/bruj0/k8s-cicd-gitlab"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Hatchling source layout: the package lives at infra/scripts/bootstrap
+# (not at the repo root) because the Python module is one piece of a
+# larger ops codebase. uv picks this up automatically.
+[tool.hatch.build.targets.wheel]
+packages = ["infra/scripts/bootstrap"]
+
+# uv workspace shims — the bootstrap is invoked from
+# `infra/scripts/bootstrap.py` directly (sys.path-based) AND can
+# also be invoked via the script entry point. Both should work.
+[tool.uv]
+package = true
