@@ -5,7 +5,7 @@
 #              Job (kubectl get secret … | base64 -d > ca.crt, then
 #              `sudo trust anchor ca.crt`). Re-export after every
 #              re-install; CAs are not stable across regenerations.
-infra/tls/
+infra/tls/*
 !infra/tls/.gitkeep
 
 # OpenTofu working files

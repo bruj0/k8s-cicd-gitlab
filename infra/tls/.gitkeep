@@ -1,0 +1,7 @@
+# Keep this dir under git even though both children are gitignored.
+# Phase 1 PKI helper used to write Phase-1-minted certs under
+# private/ (deleted — host no longer mints a cert, the GitLab
+# chart's pre-install cfssl Job does it in Phase 2).
+# Phase 2 writes the exported cluster CA to public/ca.crt via:
+#   kubectl -n gitlab get secret gitlab-wildcard-tls-ca \
+#     -o jsonpath='{.data.cfssl_ca}' | base64 -d > public/ca.crt
