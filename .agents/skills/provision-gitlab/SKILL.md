@@ -18,6 +18,11 @@ update both the relevant source AND the "Common pitfalls" section
 below** — that is what makes this skill converge to one-shot for any
 fresh Phase-1 cluster.
 
+If you are adding a new step or chart, read
+[`docs/phase-2.md`](../../docs/phase-2.md) first — it has the
+"how to add a new install step" checklist + the installer
+skeleton + the conventions every PR is measured against.
+
 ## Pre-flight
 
 ```sh

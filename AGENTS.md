@@ -55,6 +55,7 @@ derives from them.
 | [`devops-take-home.md`](../devops-take-home.md) | The rubric: minimum bar + bar. Phase 1 must clear the floor. |
 | [`README.md`](README.md) | Human-facing phase table + quick start. |
 | [`docs/phase-1.md`](docs/phase-1.md) | Phase 1 runbook with manual step-by-step. |
+| [`docs/phase-2.md`](docs/phase-2.md) | Phase 2 contributor guide: architecture, code map, "how to add a step", conventions, trade-offs. |
 | [`docs/prereqs.md`](docs/prereqs.md) | Supported OSes, hardware floor, ports, DNS. |
 | `infra/scripts/bootstrap/VERSIONS.json` | **Sole source of truth** for every pinned version (tools, helm chart, helm repo URLs). Read it before adding any new tool or chart. |
 | `.agents/skills/provision-gitlab/SKILL.md` | The Phase-2 iteration loop (run, observe, fix, repeat). Drives how an AI agent should use `bootstrap.py --phase 2`. |
