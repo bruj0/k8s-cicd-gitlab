@@ -1,10 +1,10 @@
-# Blueprint — self-hosted GitLab + k8s + CI/CD, end to end
+# CICD Blueprint — self-hosted GitLab in k8s + CI/CD, end to end
 
 > One repo, one machine, one running pipeline. A 5-node kind
 > cluster hosts a self-managed GitLab (chart-bundled Envoy
-> Gateway terminates `*.local.bruj0.net`), a registered Runner,
+> Gateway terminates `*.local.example.net`), a registered Runner,
 > and OpenBao for secret injection. Push a commit, get a running
-> workload on `https://<app>.local.bruj0.net`.
+> workload on `https://<app>.local.example.net`.
 
 This repo implements the local GitLab + k8s + CI/CD assignment
 described in [`../devops-take-home.md`](../devops-take-home.md) and
@@ -13,15 +13,15 @@ OpenTofu, build a GitLab CI pipeline that validates the IaC and a
 Helm chart, and deploy a small application end to end on
 self-hosted GitLab with its own Runner.
 
-## What you (the reviewer) get after running this
+## What you get after running this
 
 | What | Where to find it |
 | --- | --- |
 | 5-node local Kubernetes cluster (1 control-plane + 4 workers) | `kubectl get nodes` after Phase 1 |
-| Self-hosted GitLab CE | `https://gitlab.local.bruj0.net` |
+| Self-hosted GitLab CE | `https://gitlab.local.example.net` |
 | Self-registered GitLab Runner (executes CI on the same cluster) | `Admin → CI/CD → Runners` after Phase 2 |
-| Container Registry, KAS, MinIO (LFS/artifacts/packages) | `https://{registry,kas,minio}.local.bruj0.net` |
-| OpenBao (KV v2 secret store) | `https://openbao.local.bruj0.net` |
+| Container Registry, KAS, MinIO (LFS/artifacts/packages) | `https://{registry,kas,minio}.local.example.net` |
+| OpenBao (KV v2 secret store) | `https://openbao.local.example.net` |
 | Sample workload (guestbook) packaged as a Helm chart | `apps/guestbook/helm-chart/` |
 | GitLab CI pipeline that validates and deploys | **Phase 3 — pending**. The chart is in place; the `.gitlab-ci.yml` is the next deliverable. See `docs/phase-1.md § Future` and the *Trade-offs* section below. |
 
@@ -29,7 +29,7 @@ The eventual pipeline is the demo: a push to a sample app
 triggers a runner job that validates the OpenTofu code
 (`tofu validate`), validates the Helm chart (`helm template` /
 `helm lint`), and on `main` deploys the chart into the cluster,
-exposing the pod through the same `*.local.bruj0.net` wildcard
+exposing the pod through the same `*.local.example.net` wildcard
 the GitLab UI already uses. Phases 1 + 2 build the platform;
 Phase 3 wires the app into it.
 
@@ -37,12 +37,12 @@ Phase 3 wires the app into it.
 
 ```mermaid
 flowchart LR
-  dev["Developer<br/>(this repo)"] -->|git push| gl["Self-hosted GitLab<br/>gitlab.local.bruj0.net"]
+  dev["Developer<br/>(this repo)"] -->|git push| gl["Self-hosted GitLab<br/>gitlab.local.example.net"]
   gl -->|webhook| ci["GitLab CI runner job"]
   ci -->|tofu validate| ok1["IaC OK"]
   ci -->|helm lint / template| ok2["Helm OK"]
   ci -->|helm install --set image.tag=$CI_COMMIT_SHA| k8s["kind cluster (5 nodes)"]
-  k8s -->|service → ingress| app["https://app.local.bruj0.net"]
+  k8s -->|service → ingress| app["https://app.local.example.net"]
   gl -. secret ref .-> openbao["OpenBao"]
   ci -. read at job time .-> openbao
 ```
@@ -53,7 +53,7 @@ In words:
    with per-node + shared hostPath mounts under `infra/data/`.
 2. **Phase 2 — Stack.** Bootstrap installs Gateway API CRDs,
    OpenBao, GitLab CE (which sub-installs Envoy Gateway and mints
-   a self-signed wildcard cert for `*.local.bruj0.net` via a
+   a self-signed wildcard cert for `*.local.example.net` via a
    cfssl Job), and a Runner registered against the cluster-internal
    GitLab Service URL.
 3. **Phase 3 — App.** A sample app (the `guestbook` Helm chart in
@@ -91,7 +91,7 @@ uv run blueprint-bootstrap --phase 2
 ```
 
 Follow the four post-install host-side steps printed by the
-bootstrap: trust the chart's wildcard CA, add the `*.local.bruj0.net`
+bootstrap: trust the chart's wildcard CA, add the `*.local.example.net`
 mapping to `/etc/hosts`, fetch the OpenBao root token, and visit
 the UI to set the GitLab root password. Full details are in
 [docs/phase-1.md](docs/phase-1.md) and [docs/phase-2.md](docs/phase-2.md).
@@ -134,6 +134,133 @@ off, the right move is:
 There's no separate "destroy" script — the only way to create or
 delete the cluster is `tofu -chdir=infra/tofu {apply,destroy}`.
 That rule is enforced as `AGENTS.md § 4 rule #3`.
+
+## How the bootstrap + skills fit together
+
+Two tools drive this repo, and they play different roles:
+
+### The bootstrap application (`infra/scripts/bootstrap/`)
+
+A single uv-managed Python package that does the actual work.
+
+```
+infra/scripts/
+├── bootstrap.py                 # thin shim → delegates to bootstrap/
+└── bootstrap/                   # the package (installed by uv sync)
+    ├── __main__.py              # python -m bootstrap → same entry as the console script
+    ├── VERSIONS.json            # pinned versions, single source of truth
+    ├── cli.py                   # click wrapper → blueprint-bootstrap entry point
+    ├── secrets_cli.py           # click wrapper → blueprint-secrets entry point
+    ├── app.py                   # composition root: BootstrapApp wires phases → installers
+    ├── prereq.py                # Phase 1 prereq check + installer
+    ├── helm_cache.py            # downloads charts into infra/helm-charts/
+    ├── tofu.py                  # tofu init / plan / validate (read-only ops)
+    ├── paths.py                 # resolved Path constants (chart dir, secrets dir, infra/tls/)
+    ├── os_detect.py             # apt / dnf / pacman / brew branching
+    ├── shell.py                 # idempotent subprocess wrapper (logs every command)
+    ├── logger.py, versions.py, installer.py
+    └── phase2/                  # Phase 2 only
+        ├── pipeline.py          # orchestrates the 5 Phase 2 installers in order
+        ├── gateway.py           # Gateway API CRDs + chart-shipped Envoy CRDs
+        ├── openbao.py           # OpenBao chart install + init + unseal
+        ├── gitlab.py            # GitLab chart install + first-boot rails
+        ├── runner.py            # Runner chart install, registers against gitlab.svc:8181
+        ├── secrets.py           # hvac client (OpenBao) with shared port-forward
+        └── references/          # vendored Gateway API + Envoy CRDs, chart fragments
+```
+
+After `uv sync`, two console scripts land on the per-checkout
+`$PATH`:
+
+| Script | Wraps | Purpose |
+| --- | --- | --- |
+| `blueprint-bootstrap` | `bootstrap.cli:main` | The installer (`--phase 1 \| 2`, `--check`, `--dry-run`, `--user`). |
+| `blueprint-secrets`  | `bootstrap.secrets_cli:main` | Post-install helper: `read <path> <key>` and `ui` (auto-port-forwards 127.0.0.1:8200). |
+
+`BootstrapApp` (in `app.py`) is the composition root: it instantiates
+each *installer* — a single-responsibility class that takes only
+the paths and version catalog it needs — and runs them in order.
+That's the SOLID shape: appending "another installer for Phase 3"
+means adding one class under `phase3/`, one wiring line in `app.py`,
+and (if exposed via CLI) one click option in `cli.py`. No installer
+ever depends on another.
+
+The hard constraint: the bootstrap **prepares**, it never
+**applies**. There is no `--apply` flag. The cluster comes up
+only when a person runs `tofu -chdir=infra/tofu apply`. That
+boundary is documented in `AGENTS.md § 4 rule #3`.
+
+### The skills (`.agents/skills/`)
+
+Two per-phase `SKILL.md` files, one per phase. They follow the
+[`agentskills.io` open standard](https://agentskills.io), so they
+work as background context for any AI coding agent (Copilot, Claude,
+Cursor, etc.) and as plain runbooks for humans. Each skill has the
+same ten sections, in the same order:
+
+```
+1.  Pre-flight                       # what to verify before starting
+2.  Install                          # the actual install one-liner
+3.  Smoke tests                      # the checkable invariants + how to read them
+4.  URLs you can reach after install # the exact hostnames + logins
+5.  Iteration loop                   # when something is off, what to read + re-run
+6.  Canonical (known-good) pinned versions
+7.  Common pitfalls (frozen — append, don't rewrite)
+8.  Rules of thumb (apply when adding Phase-N pieces)
+9.  When the install is green        # the exact "you're done" output
+10. How to undo                      # the symmetric teardown
+```
+
+The section names vary slightly per phase (the Phase 2 skill has
+two *Rules of thumb* sections because Phase 2 touches multiple
+charts; the Phase 1 skill has one). The shape is the same, and
+both skills title the smoke-test section "Smoke tests" — that's
+the one to read first when something is off.
+
+The two skills shipped here:
+
+| Skill | Drives | Reads from |
+| --- | --- | --- |
+| [`.agents/skills/provision-phase-1/`](.agents/skills/provision-phase-1/) | `blueprint-bootstrap --phase 1` + the six `tofu apply`-style handoff commands | `bootstrap/prereq.py`, `bootstrap/helm_cache.py`, `bootstrap/tofu.py`, Headlamp chart cache |
+| [`.agents/skills/provision-gitlab/`](.agents/skills/provision-gitlab/) | `blueprint-bootstrap --phase 2` + the three post-install host-side steps (trust CA, /etc/hosts, `blueprint-secrets`) | `bootstrap/phase2/pipeline.py` + `gateway.py` / `openbao.py` / `gitlab.py` / `runner.py` / `secrets.py` |
+
+### How they relate
+
+The skills are **driving instructions**; the bootstrap is the
+**machine that executes them**:
+
+- A skill tells *what* to do and *how to verify* — it points at
+  the exact installer class to read, the exact smoke test to
+  run, the exact URL to open.
+- `uv run blueprint-bootstrap --phase N` does the work — it
+  pre-flights, installs, and prints the next user command.
+- The skill is for AI agents and humans alike; the bootstrap is
+  for both shells to call.
+
+Concrete example, Phase 2:
+
+1. The user (or an AI agent) reads `.agents/skills/provision-gitlab/SKILL.md`.
+2. The skill's *Install* section says: `uv run blueprint-bootstrap --phase 2`.
+3. `bootstrap.cli:main` parses the flag, instantiates `BootstrapApp`,
+   which wires together `Phase2Pipeline` → `GatewayCRDsInstaller`
+   → `OpenBaoInstaller` → `GitlabInstaller` → `GitLabRunnerInstaller`.
+4. Each installer reads `VERSIONS.json`, calls the injected
+   `CommandRunner` for the `helm`/`kubectl` command, and logs
+   the output under its own logger. (`CommandRunner` is the
+   idempotent subprocess Protocol in `shell.py` — every shell
+   call is logged with `--dry-run` honoured.)
+5. The skill's *Smoke tests* section walks the user through
+   verifying each step (5 Envoy pods Running, Gateway
+   Programmed=True, runner registered, OpenBao has secrets,
+   GitLab UI returns 200).
+6. The skill's *Iteration loop* maps a failed smoke test to the
+   exact installer + line range to inspect, so a fix becomes
+   "edit one class, re-run the bootstrap."
+
+When a phase lands, it's expected to grow one new installer
+class under `phase<N>/`, one new entry in `BootstrapApp`, and
+(if user-facing) one new section in the skill — not a parallel
+class hierarchy and not a new top-level command.
 
 ## Layout
 
@@ -202,7 +329,7 @@ both humans and AI agents touching this repo.
   OpenBao at `secret/gitlab/...`. Read them back via
   `uv run blueprint-secrets read <path> <key>`.
 - **TLS is local-CA now, LE later.** Public LE can't validate
-  `*.local.bruj0.net`. The GitLab chart's pre-install cfssl Job
+  `*.local.example.net`. The GitLab chart's pre-install cfssl Job
   mints the wildcard cert for us today; once public DNS is
   delegated, swap to cert-manager-issued certs without changing
   anything about the bootstrap or the chart values.
@@ -233,7 +360,7 @@ a reviewer is most likely to ask.
   registered with `kubernetes` executor; jobs spin up ephemeral
   pods. That keeps CI workloads inside the same RBAC boundary as
   the workload they deploy, no host-mount leakage.
-- **Tradeoff on local-network state.** `*.local.bruj0.net`
+- **Tradeoff on local-network state.** `*.local.example.net`
   resolves on the developer host via `/etc/hosts`, not on the
   cluster. Pods use Service DNS
   (`gitlab-webservice-default.gitlab.svc:8181`,
