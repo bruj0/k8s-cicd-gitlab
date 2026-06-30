@@ -1,6 +1,12 @@
-# Local PKI: never commit private keys
-infra/tls/private/
-# Public side stays (cert only, no key) — keep public/ tracked
+# PKI scratch dir: never commit anything under infra/tls/.
+#   private/ — Phase 1 PKI helper output (deleted; kept as a path
+#              so old checkouts don't choke on the dir).
+#   public/  — one-shot export target for the GitLab chart's cfssl
+#              Job (kubectl get secret … | base64 -d > ca.crt, then
+#              `sudo trust anchor ca.crt`). Re-export after every
+#              re-install; CAs are not stable across regenerations.
+infra/tls/
+!infra/tls/.gitkeep
 
 # OpenTofu working files
 infra/tofu/.terraform/

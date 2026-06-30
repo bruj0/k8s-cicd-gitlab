@@ -33,9 +33,10 @@ blueprint/
     └── tofu/         # OpenTofu configuration (kind cluster)
 ```
 
-(`infra/tls/private/` is gitignored; `infra/tls/public/` is the
-one-shot export target for the GitLab chart's cfssl Job — see
-Step 1 below for the export command.)
+(`infra/tls/` is fully gitignored except for `.gitkeep`. It's a
+scratch dir used as a one-shot export target for the GitLab
+chart's cfssl Job — Step 1 below writes the exported CA there
+before adding it to the host trust store.)
 
 ## Phases
 
