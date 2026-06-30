@@ -68,41 +68,128 @@ See [docs/prereqs.md](docs/prereqs.md). The short list: Linux or
 macOS, `kind` 0.27+, `kubectl`, `helm` ≥3.16, `tofu` 1.6+, `uv`
 0.4+, `podman` or `docker`, ~10 GB free RAM for the cluster + GitLab.
 
-## Quick start (the short version)
+## Quick start
 
-The full cluster + stack is up in three commands once prereqs are
-met:
+### 1. Get the code
 
 ```sh
-cd blueprint
+git clone https://github.com/bruj0/k8s-cicd-gitlab.git
+cd k8s-cicd-gitlab/blueprint
+```
 
-# 1. One-time: bootstrap the working tree (prereqs install, tofu init,
-#    helm chart cache). Idempotent.
+### 2a. Hand it to an agent (recommended)
+
+The skills under [`.agents/skills/`](.agents/skills/) follow the
+[`agentskills.io`](https://agentskills.io) open standard, which
+several AI coding agents (GitHub Copilot, Cursor, Claude Code,
+Codex) read directly as background context the moment the repo
+is opened. For agents that don't auto-discover, paste the skill
+file into the chat as a reference. The recommended loop:
+
+1. Open the `blueprint/` folder in your AI coding agent. If the
+   agent auto-loads skills (`<agent> skills` is a thing — see
+   your agent's docs), the two skills are already in context.
+   Otherwise paste
+   [`.agents/skills/provision-phase-1/SKILL.md`](.agents/skills/provision-phase-1/SKILL.md)
+   and
+   [`.agents/skills/provision-gitlab/SKILL.md`](.agents/skills/provision-gitlab/SKILL.md)
+   into the first message.
+2. Prompt the agent:
+
+   > Run `provision-phase-1` end to end and report when the
+   > cluster's 5 nodes are Ready. Then run `provision-gitlab`
+   > and report when GitLab is reachable. Don't run anything
+   > that needs `sudo` — print the command and ask me to run it.
+   > Follow each skill's Smoke tests section before declaring
+   > green.
+
+3. The agent reads each skill's `Pre-flight` → `Install` → `Smoke
+   tests` → `Iteration loop` in order, runs the matching
+   `uv run blueprint-bootstrap --phase N` command, and reads
+   back the smoke-test invariants. When something fails, the
+   skill's `Iteration loop` already maps the failure to the
+   exact installer class to fix.
+4. Review the diff (the agent should have touched only
+   `infra/scripts/bootstrap/phase<N>/` or
+   `infra/scripts/bootstrap/VERSIONS.json`) and commit.
+
+Why this works: the skill files are plain Markdown, they follow
+the canonical ten-section template, and the agent uses them as a
+deterministic runbook (Install section → one-liner) plus a
+checklist (Smoke tests section → invariants) plus a recovery
+manual (Iteration loop + Common pitfalls → where to look first).
+That keeps the agent on-rails even when a step fails.
+
+### 2b. Or run it by hand
+
+The full cluster + stack is up in four commands once prereqs are
+met (see [docs/prereqs.md](docs/prereqs.md)):
+
+```sh
+# 1. Install the bootstrap's Python deps into .venv/ (the committed
+#    uv.lock makes this reproducible). Idempotent.
 uv sync
+
+# 2. Bootstrap the working tree (prereqs check, tofu init, helm
+#    chart cache). Also idempotent. Prints the next commands.
 uv run blueprint-bootstrap --phase 1
 
-# 2. You apply — the bootstrap never does (per spec, OpenTofu is
+# 3. You apply — the bootstrap never does (per spec, OpenTofu is
 #    run by a person). Cluster comes up; Headlamp URL is printed.
 tofu -chdir=infra/tofu apply -auto-approve
 
-# 3. Install GitLab + Runner + OpenBao + chart-managed Envoy
+# 4. Install GitLab + Runner + OpenBao + chart-managed Envoy
 #    Gateway. End-to-end takes ~10 min on a beefy laptop.
 uv run blueprint-bootstrap --phase 2
 ```
 
-Follow the four post-install host-side steps printed by the
-bootstrap: trust the chart's wildcard CA, add the `*.local.example.net`
-mapping to `/etc/hosts`, fetch the OpenBao root token, and visit
-the UI to set the GitLab root password. Full details are in
-[docs/phase-1.md](docs/phase-1.md) and [docs/phase-2.md](docs/phase-2.md).
+### 3. Post-install host-side steps
 
-Then verify with the smoke tests in the matching skills, and at that
-point you have a working cluster, GitLab, Runner, and OpenBao —
-the platform Phase 3 will deploy the sample app into. Phase 3
-itself is the upcoming work (the chart at `apps/guestbook/helm-chart/`
-is ready; the `.gitlab-ci.yml` is the next deliverable; the
-assignment's `run.sh` — listed under `devops-take-home.md`
-Deliverables — is also upcoming work).
+Three steps the bootstrap can't do for you (all of them are
+outside the cluster):
+
+1. **Trust the chart's wildcard CA** — the GitLab chart's
+   pre-install cfssl Job mints `*.local.example.net` and stores
+   the CA in the `gitlab-wildcard-tls-ca` Secret; export it to
+   disk and add it to the host trust store:
+
+   ```sh
+   kubectl -n gitlab get secret gitlab-wildcard-tls-ca \
+     -o jsonpath='{.data.cfssl_ca}' | base64 -d > infra/tls/public/ca.crt
+   sudo trust anchor infra/tls/public/ca.crt
+   ```
+
+2. **Map the wildcard to 127.0.0.1** so the browser reaches
+   Envoy on the kind node:
+
+   ```sh
+   echo "127.0.0.1 gitlab.local.example.net registry.local.example.net \
+                kas.local.example.net minio.local.example.net \
+                openbao.local.example.net" | sudo tee -a /etc/hosts
+   ```
+
+3. **Read OpenBao secrets** via the `blueprint-secrets` CLI
+   (auto-port-forwards 127.0.0.1:8200, so no `kubectl port-forward`
+   is needed):
+
+   ```sh
+   uv run blueprint-secrets read gitlab initial_root_password   # GitLab root pw
+   uv run blueprint-secrets ui                                  # OpenBao UI
+   ```
+
+Full details for each phase are in
+[docs/phase-1.md](docs/phase-1.md) and [docs/phase-2.md](docs/phase-2.md).
+At that point you have a working cluster, GitLab, Runner, and
+OpenBao — the platform Phase 3 will deploy the sample app into.
+Phase 3 itself is the upcoming work (the chart at
+`apps/guestbook/helm-chart/` is ready; the `.gitlab-ci.yml` is the
+next deliverable; the assignment's `run.sh` — listed under
+`devops-take-home.md` Deliverables — is also upcoming work).
+
+Manual verification (if you went the hand-driven path): run each
+skill's *Smoke tests* section step by step. If you handed the
+repo to an agent, the agent already did this — just read its
+final report and the smoke-test output it captured.
 
 The full URLs and login credentials after each phase are
 maintained in the per-phase skills so they don't drift:
