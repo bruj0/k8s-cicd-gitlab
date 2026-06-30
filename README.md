@@ -30,9 +30,12 @@ blueprint/
     │       ├── secrets_cli.py  # click wrapper: blueprint-secrets (post-install helper)
     │       ├── app.py          # composition root
     │       └── phase2/         # Phase 2 installers (GitLab, Runner, OpenBao)
-    ├── tofu/         # OpenTofu configuration (kind cluster)
-    └── tls/          # Generated local CA + wildcard cert (gitignored)
+    └── tofu/         # OpenTofu configuration (kind cluster)
 ```
+
+(`infra/tls/private/` is gitignored; `infra/tls/public/` is the
+one-shot export target for the GitLab chart's cfssl Job — see
+Step 1 below for the export command.)
 
 ## Phases
 
@@ -168,9 +171,10 @@ The chart does the heavy lifting — the bootstrap just drives it:
 Three one-time host-side steps, none of which the bootstrap can
 do for you (they all live outside the cluster):
 
-1. **Trust the local CA** (the chart's cfssl Job minted the
-   wildcard for `*.local.bruj0.net`; export the CA and install
-   it in the host trust store):
+1. **Trust the GitLab chart's wildcard CA** (the chart's
+   pre-install cfssl Job mints `*.local.bruj0.net` and stores
+   the CA in the `gitlab-wildcard-tls-ca` Secret; export it
+   to disk and add it to the host trust store):
 
    ```sh
    kubectl -n gitlab get secret gitlab-wildcard-tls-ca \
