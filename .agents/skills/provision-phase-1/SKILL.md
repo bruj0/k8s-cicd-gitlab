@@ -112,11 +112,6 @@ echo "probe-$$" | sudo tee infra/data/node1/probe.txt > /dev/null
 docker exec cicd-worker cat /var/local/node1/probe.txt
 sudo rm -f infra/data/node1/probe.txt
 # Expected: prints "probe-<pid>".
-#
-# The kind provider does NOT mount blueprint/data/ (the tracked
-# placeholder with only .gitkeep files). Don't be fooled by the
-# "data/" in AGENTS.md's layout tree — only infra/data/ is wired
-# to extraMounts.
 
 # 4. Headlamp is installed + has a NodePort.
 kubectl -n headlamp get deploy,svc,pods
@@ -204,7 +199,6 @@ edit the right file, and move on.
 - `error: You must be logged in to the server (Unauthorized)` from any `kubectl` command → the kubeconfig at `infra/tofu/kubeconfig` was written by an older `tofu apply` and the kind node cert rotated. Re-run `tofu -chdir=infra/tofu apply -auto-approve` (idempotent) to rewrite it.
 - `Headlamp pod stuck in CrashLoopBackOff` with `ImagePullBackOff` in Events → the headlamp container image pull rate-limited. The chart is installed by you (not the bootstrap), so re-run the helm upgrade with `--set image.pullPolicy=IfNotPresent` and it'll use the local image cache.
 - `docker exec` returns "No such container: kind-cicd-..." → kind 0.27+ no longer prefixes container names with `kind-`. The actual names are `cicd-control-plane`, `cicd-worker`, `cicd-worker2`, `cicd-worker3`, `cicd-worker4`. Look at `docker ps` to see the real names.
-- Writes to `blueprint/data/nodeN/` aren't visible from inside the cluster → that's expected. The kind cluster only mounts `infra/data/nodeN/` (configured by the `data_root` variable in `infra/tofu/tofu.tfvars`). The `blueprint/data/` directory is a tracked placeholder with only `.gitkeep` files; it's never mounted.
 - `Permission denied` writing to `infra/data/nodeN/` from the host as a non-root user → the bind-mount targets are created by kind as `root:root 755` on the first `tofu apply`. The bootstrap can't `chown` (root-only) and won't try. Two options: (1) `sudo chown -R $USER:users infra/data/` once after the first `tofu apply`, or (2) write through `sudo tee ... > /dev/null` for individual files. Option 1 is one-and-done and the recommended fix; option 2 is fine for ad-hoc smoke tests.
 - **CRITICAL: the only way to create or delete the cluster is `tofu`.** No `kind create cluster --name=cicd`, no `docker rm -f cicd-*`, no `kubectl delete namespace` to "tidy up". See AGENTS.md § 4 rule #3. The tofu state file at `infra/tofu/terraform.tfstate` is the source of truth; if `tofu state list` is non-empty when `docker ps | grep ^cicd-` is empty, the cluster is in a weird state — fix with `tofu state rm <orphan>` (per resource), not hand-deletion of state.
 - **CRITICAL: the bootstrap is preparation-only.** It runs `tofu init` and `tofu validate` but **never** `tofu plan` or `tofu apply`. If you find yourself wanting to add a `--apply` flag to the bootstrap, stop — see AGENTS.md § 4 rule #1.
@@ -250,8 +244,7 @@ rm -rf infra/tofu/tofu.tfvars
 rm -rf infra/helm-charts/headlamp-*.tgz
 ```
 
-`infra/data/*` (and the stale `blueprint/data/` placeholder) are
-on the host so they survive cluster destroy. Delete them
-manually if you want a clean slate. After undo, a fresh `uv
-run blueprint-bootstrap
---phase 1` re-preps everything, followed by your `tofu apply`.
+`infra/data/*` is on the host so it survives cluster destroy.
+Delete it manually if you want a clean slate. After undo, a
+fresh `uv run blueprint-bootstrap --phase 1` re-preps
+everything, followed by your `tofu apply`.

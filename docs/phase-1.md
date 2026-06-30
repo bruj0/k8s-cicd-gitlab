@@ -117,10 +117,10 @@ manually if you want a clean slate:
 rm -rf infra/data/node{1,2,3,4}/* infra/data/shared/*
 ```
 
-(`blueprint/data/` exists too — a tracked placeholder with only
-`.gitkeep` files. The kind cluster does **not** mount it. The
-real hostPath source is `infra/data/`, configured by the
-`data_root` variable in `infra/tofu/tofu.tfvars`.)
+(The real hostPath source is `infra/data/`, configured by the
+`data_root` variable in `infra/tofu/tofu.tfvars` which defaults
+to `../data` — relative to `infra/tofu/`, that resolves to
+`infra/data/`.)
 
 ## Trade-offs
 

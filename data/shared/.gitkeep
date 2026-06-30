@@ -1,5 +1,0 @@
-Placeholder. See `data/node1/.gitkeep` for context.
-
-This path is the canonical hostPath source for the kind
-cluster's shared `/var/local/shared` mount (mounted on every
-node, control-plane included).

@@ -1,7 +1,0 @@
-Placeholder so git tracks this empty directory.
-
-Per `spec.md`, this path is the canonical hostPath source for
-the kind worker's `/var/local/node1` mount. In this repo the
-active path is `infra/data/node1/` (the tofu config defaults
-`data_root = "../data"`, which from `infra/tofu/` resolves
-there); see `AGENTS.md` §7 for the path-resolution note.

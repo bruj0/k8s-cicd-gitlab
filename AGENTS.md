@@ -81,17 +81,13 @@ blueprint/
 │   ├── guestbook/                       # demo: classic k8s guestbook (Go app + helm chart)
 │   ├── redis/                           # demo: redis master + loose k8s YAMLs + helm chart
 │   └── redis-slave/                     # demo: redis slave workload + helm chart
-├── data/                                # hostPath mounts for kind nodes (spec dirs)
-│   ├── node1/ node2/ node3/ node4/ node5/   # one per kind worker (empty)
-│   └── shared/                          # bind-mounted on every kind node (empty)
 ├── docs/
 │   ├── phase-1.md
 │   └── prereqs.md
 └── infra/
-    ├── data/                            # ← actively used hostPath source (see §8)
+    ├── data/                            # ← hostPath source for the kind cluster (workers 1..4 + shared)
     │   ├── node1..node4/                # bound to kind workers 1..4
-    │   ├── node5/                       # present but unused (see §8)
-    │   └── shared/                      # bound to every kind node
+    │   └── shared/                      # bound to every kind node (incl. control-plane)
     ├── helm-charts/                     # locally cached charts (Headlamp, GitLab, Runner, OpenBao, ...)
     ├── scripts/
     │   ├── bootstrap.py                 # thin shim → delegates to bootstrap/ package

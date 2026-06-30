@@ -14,12 +14,10 @@ blueprint/
 │   ├── guestbook/    # Demo: classic k8s guestbook
 │   ├── redis/        # Demo: redis master + slave
 │   └── redis-slave/  # Demo: redis slave workload
-├── data/             # Persistent storage that survives cluster destroy
-│   ├── node1..5/     # One dir per kind node (extraMount hostPath)
-│   └── shared/       # Shared extraMount on every node
 ├── docs/             # Per-phase runbooks + prereqs
 │   ├── prereqs.md
-│   └── phase-1.md
+│   ├── phase-1.md
+│   └── phase-2.md
 ├── pyproject.toml    # uv project: installs blueprint-bootstrap + blueprint-secrets
 ├── uv.lock           # committed for reproducibility
 └── infra/            # OpenTofu + provisioning scripts
