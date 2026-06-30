@@ -179,6 +179,13 @@ violate either of them, stop and ask.
   a yaml). The current code generates one openssl cnf inline in
   `pki.py`; that's a pre-existing wart flagged for a future refactor
   (see "Known debt" below).
+- **Skill frontmatter must be single-line.** Any `.agents/skills/*/SKILL.md`
+  `description:` field is **one quoted string**, not a folded multi-line
+  scalar. Reason: skill loaders use YAML's compact-mapping parser; an
+  indented continuation like `  Traefik (with Gateway API): ...` gets
+  re-interpreted as a nested mapping and the whole frontmatter fails
+  to parse. Quoting with `'…'` is mandatory when the description
+  contains colons or runs over 80 chars.
 - **Everything must be stored in `blueprint/`.** No stray files at the
   repo root or in `~`. The `apps/`, `infra/`, `data/`, `helm-charts/`
   layout is mandatory.
