@@ -21,11 +21,16 @@ on top of the `devops-take-home.md` assignment. It currently delivers
   per-node and shared hostPath mounts, a self-signed wildcard cert for
   `*.local.bruj0.net`, and a Headlamp dashboard chart pre-cached for
   the user to install.
-- **Phase 2**: GitLab CE + Runner + OpenBao + Traefik (with Gateway API)
-  installed end-to-end into the Phase-1 cluster via
-  `bootstrap.py --phase 2`. Secrets bootstrap goes through OpenBao;
-  TLS termination is handled by Traefik's Gateway. Iteration happens
-  via `.agents/skills/provision-gitlab/SKILL.md`.
+- **Phase 2**: GitLab CE + Runner + OpenBao installed end-to-end into
+  the Phase-1 cluster via `uv run blueprint-bootstrap --phase 2`.
+  The GitLab chart sub-installs Envoy Gateway as its managed ingress
+  controller, mints a self-signed wildcard cert for `*.local.bruj0.net`
+  via its pre-install Job (cfssl), and injects the cert into the
+  Gateway listener — no separate Traefik chart, no separate
+  cert-manager, no custom GatewayClass chart. Secrets bootstrap goes
+  through OpenBao via the `hvac` Python client (auto-port-forwards
+  127.0.0.1:8200). Iteration happens via
+  `.agents/skills/provision-gitlab/SKILL.md`.
 
 Phase 3 (Helm-deployed app, CI pipeline, secret-injection via OpenBao)
 is planned but not implemented.
@@ -85,45 +90,40 @@ blueprint/
     │   ├── node1..node4/                # bound to kind workers 1..4
     │   ├── node5/                       # present but unused (see §8)
     │   └── shared/                      # bound to every kind node
-    ├── helm-charts/                     # locally cached charts (Headlamp)
+    ├── helm-charts/                     # locally cached charts (Headlamp, GitLab, Runner, OpenBao, ...)
     ├── scripts/
     │   ├── bootstrap.py                 # thin shim → delegates to bootstrap/ package
-    │   ├── pki.py                       # openssl wrapper: local CA + wildcard leaf
-    │   └── bootstrap/                   # class-based package (SOLID)
-    │       ├── __init__.py
-    │       ├── __main__.py              # `python3 -m bootstrap`
-    │       ├── app.py                   # composition root (BootstrapApp)
-    │       ├── paths.py                 # resolved filesystem paths (Paths dataclass)
-    │       ├── logger.py                # Logger protocol + ConsoleLogger / NullLogger
-    │       ├── shell.py                 # CommandRunner protocol + SubprocessRunner / DryRunRunner
-    │       ├── versions.py              # VERSIONS dict, load_versions(), tool_pin(), helm_repo()
-    │       ├── VERSIONS.json            # pinned versions (read by versions.py)
-    │       ├── os_detect.py             # OSFamily detection (arch/debian/rhel/darwin/other)
-    │       ├── installer.py             # Installer Strategy (ArchInstaller / DebianInstaller / RhelInstaller / DarwinInstaller)
-    │       ├── prereq.py                # PrereqTool ABC + Docker/Kubectl/Kind/Helm/Tofu/Openssl + PrereqRegistry
-    │       ├── pki.py                   # PkiRunner (delegates to ../pki.py)
-    │       ├── tofu.py                  # TofuRunner (init / validate / next_steps; NO apply)
-    │       ├── helm_cache.py            # HelmChartCache (downloads <name>-<ver>.tgz to infra/helm-charts/)
-    │       └── app_installer.py         # HelmAppInstaller generic + HeadlampInstaller subclass + installer_for() factory
-    │       └── phase2/                  # Phase 2: install GitLab + Runner + OpenBao + Traefik
-    │           ├── __init__.py          # re-exports Phase2Pipeline + installers
-    │           ├── pipeline.py          # 8-step orchestrator (called from app.py:BootstrapApp)
-    │           ├── catalog.py           # Phase2Installers dataclass (bundle of every installer)
-    │           ├── cert.py              # WildcardCertInstaller — republishes Phase-1 wildcard cert
-    │           ├── traefik.py           # TraefikInstaller — reverse proxy with Gateway API
-    │           ├── openbao.py           # OpenBaoInstaller — chart install + init/unseal (also handles `Running` vs `Ready`)
-    │           ├── secrets.py           # OpenBaoClient — `kubectl exec ... bao ...` wrapper (login + kv v2 mount)
-    │           ├── gitlab.py            # GitlabInstaller — chart + set-root-password + capture runner token
-    │           ├── runner.py            # GitLabRunnerInstaller — registers against gitlab.local.bruj0.net
-    │           ├── gateway.py           # GatewayApplier — installs upstream CRDs + applies Gateway + HTTPRoute YAMLs
-    │           └── references/          # install-time YAML (committed, see spec rule "templates must have their own files")
-    │               ├── helm-values-traefik.yaml
-    │               ├── helm-values-openbao.yaml
-    │               ├── helm-values-gitlab.yaml
-    │               ├── helm-values-runner.yaml
-    │               ├── gateway.yaml             # GatewayClass + Gateway for *.local.bruj0.net
-    │               ├── httproute-gitlab.yaml     # gitlab.local.bruj0.net → gitlab-webservice
-    │               └── httproute-openbao.yaml    # openbao.local.bruj0.net → openbao-ui
+    │   └── bootstrap/                   # class-based package (SOLID), packaged via pyproject.toml
+    │   │       ├── __init__.py
+    │   │       ├── __main__.py          # `python3 -m bootstrap`
+    │   │       ├── cli.py               # click wrapper: `blueprint-bootstrap` entry point
+    │   │       ├── secrets_cli.py       # click wrapper: `blueprint-secrets` entry point (post-install helper)
+    │   │       ├── app.py               # composition root (BootstrapApp)
+    │   │       ├── paths.py             # resolved filesystem paths (Paths dataclass)
+    │   │       ├── logger.py            # Logger protocol + ConsoleLogger / NullLogger
+    │   │       ├── shell.py             # CommandRunner protocol + SubprocessRunner / DryRunRunner
+    │   │       ├── versions.py          # VERSIONS dict, load_versions(), tool_pin(), helm_repo()
+    │   │       ├── VERSIONS.json        # pinned versions (read by versions.py)
+    │   │       ├── os_detect.py         # OSFamily detection (arch/debian/rhel/darwin/other)
+    │   │       ├── installer.py         # Installer Strategy (ArchInstaller / DebianInstaller / RhelInstaller / DarwinInstaller)
+    │   │       ├── prereq.py            # PrereqTool ABC + Docker/Kubectl/Kind/Helm/Tofu + PrereqRegistry
+    │   │       ├── tofu.py              # TofuRunner (init / validate / next_steps; NO apply)
+    │   │       ├── helm_cache.py        # HelmChartCache (downloads <name>-<ver>.tgz to infra/helm-charts/)
+    │   │       ├── app_installer.py     # HelmAppInstaller generic + HeadlampInstaller subclass + installer_for() factory
+    │   │       └── phase2/              # Phase 2: install GitLab + Runner + OpenBao (chart manages Envoy + cert)
+    │   │           ├── __init__.py      # re-exports Phase2Pipeline + installers
+    │   │           ├── pipeline.py      # 5-step orchestrator (called from app.py:BootstrapApp)
+    │   │           ├── catalog.py       # Phase2Installers dataclass (bundle of every installer)
+    │   │           ├── gateway.py       # GatewayCRDsInstaller — upstream standard CRDs + chart-shipped Envoy CRDs
+    │   │           ├── openbao.py       # OpenBaoInstaller — chart install + init/unseal
+    │   │           ├── secrets.py       # OpenBaoClient — hvac-backed client + auto port-forward
+    │   │           ├── gitlab.py        # GitlabInstaller — chart + set-root-password + capture runner token
+    │   │           ├── runner.py        # GitLabRunnerInstaller — registers against in-cluster Service DNS
+    │   │           └── references/      # install-time YAML (committed, see spec rule "templates must have their own files")
+    │   │               ├── helm-values-openbao.yaml
+    │   │               ├── helm-values-gitlab.yaml
+    │   │               ├── helm-values-runner.yaml
+    │   │               └── gateway-api-crds/   # 3 vendored CRDs (1 standard + 2 Envoy chart-shipped)
     ├── secrets/                         # gitignored: OpenBao init JSON (mode 0700, see phase2/openbao.py)
     ├── tofu/                            # OpenTofu configuration
     │   ├── providers.tf                 # kind ~> 0.11, helm ~> 3.0, local ~> 2.5, null ~> 3.2
@@ -167,9 +167,10 @@ violate any of them, stop and ask.
      iteration is fast.
    - The dividing line is **infrastructure vs. applications**. Anything
      that creates/alters the cluster itself (kind nodes, network, host
-     mounts, TLS CA) stays manual. Anything that runs *on top of* an
-     existing cluster (GitLab, Runner, OpenBao, Traefik, app charts)
-     may be driven by the bootstrap in Phase 2+.
+     mounts) stays manual. Anything that runs *on top of* an existing
+     cluster (GitLab, Runner, OpenBao, app charts) may be driven by
+     the bootstrap in Phase 2+. The chart handles Envoy + cert for
+     us; we don't manage either directly.
 
 ### Other rules (less strict but still apply)
 
@@ -180,15 +181,30 @@ violate any of them, stop and ask.
   hardcodes a version string. Bump versions in JSON, never in code.
 - **Helm charts stored locally at `infra/helm-charts/`.** The bootstrap
   downloads them there; consumers install from that path.
-- **Secrets stored in OpenBao, never in plain.** Phase 1 violates this
-  on purpose — the local CA private key is the only "secret" and lives
-  in `infra/tls/private/` (gitignored). Phase 2 moves all real secrets
-  to OpenBao.
+- **Secrets stored in OpenBao, never in plain.** Phase 2 stores
+  GitLab's initial root password and the Runner registration token
+  in `infra/secrets/openbao-init.json` (gitignored, mode 0600) and
+  the same values are pushed into OpenBao at
+  `secret/gitlab/initial_root_password` and
+  `secret/gitlab/runner/registration_token`. The bootstrap reads
+  them back via the `hvac` Python client (`OpenBaoClient`,
+  `bootstrap-secrets` CLI), which auto-port-forwards
+  `127.0.0.1:8200` to the `openbao` Service on first use.
 - **No hardcoded templates inside Python scripts.** All templates
-  belong in their own files (e.g. an openssl cnf file, a Jinja template,
-  a yaml). The current code generates one openssl cnf inline in
-  `pki.py`; that's a pre-existing wart flagged for a future refactor
-  (see "Known debt" below).
+  belong in their own files (a Jinja template, a yaml, etc.). The
+  old Phase 1 PKI step generated an openssl cnf inline in
+  `bootstrap/pki.py`; that file was removed when we switched to
+  the GitLab chart's cfssl-based cert mint. Keep an eye out for
+  new ad-hoc templating creeping into the bootstrap — extract
+  to a file under `references/` instead.
+- **Use `uv` for the Python toolchain.** The bootstrap is a uv
+  project (`pyproject.toml` + `uv.lock` committed, `.venv/`
+  gitignored). New entry points go under `[project.scripts]`;
+  `uv sync` picks them up. The two installed entry points are
+  `blueprint-bootstrap` (the install CLI) and `blueprint-secrets`
+  (the post-install helper for reading OpenBao secrets + opening
+  the UI). Don't reintroduce system-level `pip install` — the
+  virtualenv is per-checkout and rebuildable from the lockfile.
 - **Skill frontmatter must be single-line.** Any `.agents/skills/*/SKILL.md`
   `description:` field is **one quoted string**, not a folded multi-line
   scalar. Reason: skill loaders use YAML's compact-mapping parser; an
@@ -218,19 +234,17 @@ violate any of them, stop and ask.
 
 ```mermaid
 flowchart TD
-    U[User runs bootstrap.py]
+    U[User runs uv run blueprint-bootstrap]
     U --> A[BootstrapApp.run]
 
     subgraph Composition[Composition root - app.py]
         A --> P[PrereqTool Registry<br/>check + install missing prereqs]
-        A --> K[PkiRunner<br/>delegate to ../pki.py openssl]
         A --> T[TofuRunner<br/>init / validate ONLY - NO apply]
         A --> H[HelmChartCache<br/>pull tgz to infra/helm-charts/]
         A --> L[HelmAppInstaller<br/>generic + Headlamp subclass<br/>cache + print helm cmd]
     end
 
-    P --> O[/usr/bin docker kubectl kind helm tofu openssl/]
-    K --> TLS[(infra/tls/private/<br/>ca.crt, ca.key<br/>_.<domain>.crt, _.<domain>.key)]
+    P --> O[/usr/bin docker kubectl kind helm tofu/]
     T --> TF[(infra/tofu/.terraform/<br/>providers downloaded)]
     H --> HC[(infra/helm-charts/<br/>headlamp-0.43.0.tgz)]
     L --> STDOUT[stdout only<br/>no side effects]
@@ -248,8 +262,9 @@ flowchart TD
     class O,TLS,TF,HC,STDOUT,NODES storage;
 ```
 
-The user runs `python3 infra/scripts/bootstrap.py --phase 1` exactly
-**once**. Then they execute the printed commands. Bootstrap is never
+The user runs `uv run blueprint-bootstrap --phase 1` exactly
+**once** (after a one-time `uv sync` to install the bootstrap's
+deps). Then they execute the printed commands. Bootstrap is never
 invoked again (re-running is a safe no-op for idempotency, but the
 real work happens from the printed commands onward).
 
@@ -316,8 +331,7 @@ class VaultInstaller(HelmAppInstaller):
 # in bootstrap/phase2/catalog.py:
 @dataclass(frozen=True)
 class Phase2Installers:
-    cert: WildcardCertInstaller
-    traefik: TraefikInstaller
+    gateway: GatewayCRDsInstaller
     openbao: OpenBaoInstaller
     gitlab: GitlabInstaller
     runner: GitLabRunnerInstaller
@@ -325,8 +339,7 @@ class Phase2Installers:
 
 # in app.py:BootstrapApp.__init__:
 self._phase2_installers = Phase2Installers(
-    cert=self._phase2_cert,
-    traefik=TraefikInstaller(...),
+    gateway=GatewayCRDsInstaller(...),
     openbao=OpenBaoInstaller(...),
     gitlab=GitlabInstaller(..., self._phase2_openbao_client),
     runner=GitLabRunnerInstaller(..., self._phase2_openbao_client),
@@ -336,7 +349,62 @@ self._phase2_installers = Phase2Installers(
 
 Wire the new step into `bootstrap/phase2/pipeline.py:_step_*` and
 add a matching YAML reference under `references/`.
-````
-<userPrompt>
-Provide the fully rewritten file, incorporating the suggested code change. You must produce the complete file.
-</userPrompt>
+
+### User-facing access after Phase 2 completes
+
+After `uv run blueprint-bootstrap --phase 2` finishes, the user
+needs three things from the host to actually use the stack: (1)
+TLS trust, (2) `/etc/hosts` entries for the wildcard domain, and
+(3) a way to read OpenBao secrets. None of these are automated
+because they all live outside the cluster.
+
+1. **Trust the local CA** (the chart mints a self-signed wildcard
+   for `*.local.bruj0.net` via its pre-install cfssl job; export
+   the CA and install it in the host trust store):
+   ```sh
+   kubectl -n gitlab get secret gitlab-wildcard-tls-ca \
+     -o jsonpath='{.data.cfssl_ca}' | base64 -d > infra/tls/public/ca.crt
+   sudo trust anchor infra/tls/public/ca.crt
+   ```
+
+2. **Map `*.local.bruj0.net` to 127.0.0.1** (so the browser
+   reaches the kind node port forwards). Add the entries once:
+   ```sh
+   echo "127.0.0.1 gitlab.local.bruj0.net registry.local.bruj0.net \
+                kas.local.bruj0.net minio.local.bruj0.net" | sudo tee -a /etc/hosts
+   ```
+
+3. **Read OpenBao secrets** via the `blueprint-secrets` CLI
+   (auto-port-forwards 127.0.0.1:8200, so no `kubectl port-forward`
+   is needed):
+   ```sh
+   uv run blueprint-secrets read gitlab initial_root_password   # GitLab root pw
+   uv run blueprint-secrets ui                                  # OpenBao UI
+   ```
+
+   The same access works from any Python session via `hvac.Client`
+   — see `OpenBaoClient` in `bootstrap/phase2/secrets.py` for the
+   pattern.
+
+#### URLs the user can reach (all on `127.0.0.1`)
+
+| URL                            | Login              | What it is                                      |
+| ------------------------------ | ------------------ | ----------------------------------------------- |
+| `https://gitlab.local.bruj0.net`     | `root` / OpenBao secret | GitLab UI (web, API, registry, KAS)        |
+| `https://registry.local.bruj0.net`    | `root` / OpenBao secret | GitLab Container Registry                   |
+| `https://kas.local.bruj0.net`        | `root` / OpenBao secret | GitLab Agent Server (KAS)                   |
+| `https://minio.local.bruj0.net`      | `root` / OpenBao secret | MinIO (GitLab object storage, LFS, artifacts) |
+| `https://openbao.local.bruj0.net`    | root token in `infra/secrets/openbao-init.json` | OpenBao UI (via Envoy Gateway)     |
+
+The Envoy Gateway sub-chart is what makes all of the above
+reachable through the `*.local.bruj0.net` hostnames. The
+GitLab chart's own pre-install Job mints the wildcard cert
+and injects it into the gateway listener — no Traefik, no
+cert-manager, no custom GatewayClass chart.
+
+If the user would rather hit the kind node IPs directly, the
+`registry`/`kas`/`minio` Services are reachable on the
+NodePort range that `kind` exposes (look at
+`kubectl -n gitlab get svc -o wide`); the `gitlab.local.bruj0.net`
+hostname is what makes TLS work without per-host
+`--resolve` overrides.

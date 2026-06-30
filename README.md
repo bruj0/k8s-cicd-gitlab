@@ -2,8 +2,9 @@
 
 This blueprint implements the end-to-end local DevOps workflow described in
 `../spec.md` (and, by extension, `../devops-take-home.md`). It uses
-OpenTofu, kind, the GitLab Helm chart, OpenBao, and Traefik with Gateway
-API support. All artifacts live under `blueprint/`.
+OpenTofu, kind, the GitLab Helm chart, OpenBao, and the GitLab
+chart's managed Envoy Gateway sub-chart. All artifacts live under
+`blueprint/`.
 
 ## Layout
 
@@ -19,13 +20,18 @@ blueprint/
 ├── docs/             # Per-phase runbooks + prereqs
 │   ├── prereqs.md
 │   └── phase-1.md
+├── pyproject.toml    # uv project: installs blueprint-bootstrap + blueprint-secrets
+├── uv.lock           # committed for reproducibility
 └── infra/            # OpenTofu + provisioning scripts
-    ├── helm-charts/  # Locally-cached helm charts (Headlamp, ...)
+    ├── helm-charts/  # Locally-cached helm charts (GitLab, Runner, OpenBao, Headlamp, ...)
     ├── scripts/      # Python helpers
-    │   ├── pki.py            # Local CA + wildcard cert (openssl wrapper)
-    │   └── bootstrap/        # Class-based prep pipeline (SOLID)
-    │       ├── VERSIONS.json # Pinned versions, single source of truth
-    │       └── app.py        # Composition root
+    │   ├── bootstrap.py  # thin shim → delegates to bootstrap/ package
+    │   └── bootstrap/    # class-based pipeline (SOLID), packaged via pyproject.toml
+    │       ├── VERSIONS.json  # Pinned versions, single source of truth
+    │       ├── cli.py          # click wrapper: blueprint-bootstrap entry point
+    │       ├── secrets_cli.py  # click wrapper: blueprint-secrets (post-install helper)
+    │       ├── app.py          # composition root
+    │       └── phase2/         # Phase 2 installers (GitLab, Runner, OpenBao)
     ├── tofu/         # OpenTofu configuration (kind cluster)
     └── tls/          # Generated local CA + wildcard cert (gitignored)
 ```
@@ -35,14 +41,14 @@ blueprint/
 | Phase | Status   | What it delivers                                                            |
 | ----- | -------- | --------------------------------------------------------------------------- |
 | 1     | ✅ done  | Local 5-node kind cluster provisioned by OpenTofu, per-node + shared mounts |
-| 2     | ✅ done  | GitLab (minimal) + Runner + OpenBao + Traefik w/ Gateway API, reachable at `https://gitlab.local.bruj0.net` |
+| 2     | ✅ done  | GitLab (minimal) + Runner + OpenBao + chart-managed Envoy Gateway, reachable at `https://gitlab.local.bruj0.net` |
 | 3     | pending  | Helm-deployed app, CI pipeline, secret-injection via OpenBao               |
 
 See [docs/phase-1.md](docs/phase-1.md) for the Phase 1 runbook.
 
 ## Quick start (Phase 1)
 
-Bootstrap **provisions** the working tree (prereqs, PKI, OpenTofu
+Bootstrap **provisions** the working tree (prereqs, OpenTofu
 providers, Headlamp chart cache) and **prints** the next commands.
 It never runs `tofu apply` itself — per spec, OpenTofu is run by a
 person.
@@ -50,8 +56,12 @@ person.
 ```sh
 cd blueprint
 
-# Step 0 — Run the prep pipeline (idempotent; safe to re-run).
-python3 infra/scripts/bootstrap.py --phase 1
+# Step 0a — One-time: install the bootstrap's Python deps into
+# .venv/ (committed uv.lock means this is reproducible).
+uv sync
+
+# Step 0b — Run the prep pipeline (idempotent; safe to re-run).
+uv run blueprint-bootstrap --phase 1
 ```
 
 After Step 0, bootstrap is done and exits. The next six commands are
@@ -90,7 +100,7 @@ If you only want the user-facing commands (no prep, no prereqs check),
 print them anytime with:
 
 ```sh
-python3 infra/scripts/bootstrap.py --user
+uv run blueprint-bootstrap --user
 ```
 
 ### Other modes
@@ -115,25 +125,99 @@ cd blueprint
 export KUBECONFIG=$PWD/infra/tofu/kubeconfig
 
 # Optional: pre-flight check (no installs, just verifies cluster + helm).
-python3 infra/scripts/bootstrap.py --phase 2 --check
+uv run blueprint-bootstrap --phase 2 --check
 
-# Install everything (Traefik, OpenBao, GitLab, Runner, Gateway + HTTPRoutes).
-python3 infra/scripts/bootstrap.py --phase 2
-
-# Trust the local CA so curl / your browser accept the self-signed cert.
-sudo trust anchor infra/tls/public/ca.crt
-
-# Open GitLab: https://gitlab.local.bruj0.net  (login: root)
-# Open OpenBao: https://openbao.local.bruj0.net  (initial root token in
-#   infra/secrets/openbao-init.json, gitignored, chmod 600)
+# Install everything (Gateway API CRDs, OpenBao, GitLab + Envoy, Runner).
+uv run blueprint-bootstrap --phase 2
 ```
 
-Phase 2 runs the 8-step pipeline end-to-end. Every step is idempotent —
+Phase 2 runs the 5-step pipeline end-to-end. Every step is idempotent —
 **re-runs are safe**. If a step fails, fix the corresponding installer
 or YAML reference under `infra/scripts/bootstrap/phase2/` and re-run.
 The iteration loop (with a frozen list of known pitfalls) is documented
 at
 [`.agents/skills/provision-gitlab/SKILL.md`](.agents/skills/provision-gitlab/SKILL.md).
+
+### What Phase 2 installs (and why)
+
+The chart does the heavy lifting — the bootstrap just drives it:
+
+  - **Gateway API CRDs** (upstream standard + 2 chart-shipped Envoy
+    CRDs the GitLab chart needs) — installed by
+    `phase2/gateway.py:GatewayCRDsInstaller` from
+    `https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml`
+    + `infra/scripts/bootstrap/phase2/references/gateway-api-crds/`.
+  - **OpenBao** (KV v2 secret store) — chart installed by
+    `phase2/openbao.py`, then `init` + `unseal` once. Init JSON
+    persisted to `infra/secrets/openbao-init.json` (gitignored,
+    `chmod 600`).
+  - **GitLab CE** — chart installed by `phase2/gitlab.py`. The
+    chart sub-installs **Envoy Gateway 1.7.1** as its
+    `gateway-helm` sub-chart and mints a **self-signed wildcard
+    cert** for `*.local.bruj0.net` via a pre-install cfssl Job.
+    The bootstrap then sets the root password via `gitlab-rails
+    runner` and captures the Runner registration token into
+    OpenBao at `secret/gitlab/runner/registration_token`.
+  - **GitLab Runner** — chart installed by `phase2/runner.py`,
+    using the registration token from OpenBao. Registers
+    against the in-cluster Service DNS
+    (`gitlab-webservice-default.gitlab.svc:8181`), not the
+    `*.local.bruj0.net` hostname (which doesn't resolve inside
+    the cluster — see AGENTS.md rule).
+
+### What you (the user) need to do post-install
+
+Three one-time host-side steps, none of which the bootstrap can
+do for you (they all live outside the cluster):
+
+1. **Trust the local CA** (the chart's cfssl Job minted the
+   wildcard for `*.local.bruj0.net`; export the CA and install
+   it in the host trust store):
+
+   ```sh
+   kubectl -n gitlab get secret gitlab-wildcard-tls-ca \
+     -o jsonpath='{.data.cfssl_ca}' | base64 -d > infra/tls/public/ca.crt
+   sudo trust anchor infra/tls/public/ca.crt
+   ```
+
+2. **Map the wildcard to 127.0.0.1** (so the browser reaches
+   Envoy on the kind node):
+
+   ```sh
+   echo "127.0.0.1 gitlab.local.bruj0.net registry.local.bruj0.net \
+                kas.local.bruj0.net minio.local.bruj0.net \
+                openbao.local.bruj0.net" | sudo tee -a /etc/hosts
+   ```
+
+3. **Read OpenBao secrets** (the `blueprint-secrets` CLI
+   auto-port-forwards 127.0.0.1:8200, so no `kubectl port-forward`
+   is needed):
+
+   ```sh
+   uv run blueprint-secrets read gitlab initial_root_password   # GitLab root pw
+   uv run blueprint-secrets ui                                  # OpenBao UI
+   ```
+
+### URLs you can reach after install
+
+All of these are `https://<hostname>/`, served by the chart's
+Envoy Gateway sub-chart on the kind cluster, terminated with the
+self-signed wildcard cert the chart minted in step 4. Trust the
+CA first (above).
+
+| URL                                  | Login                                              | What it is                                |
+| ------------------------------------ | -------------------------------------------------- | ----------------------------------------- |
+| `https://gitlab.local.bruj0.net`           | `root` / OpenBao secret                            | GitLab web UI + API                       |
+| `https://registry.local.bruj0.net`         | `root` / OpenBao secret                            | GitLab Container Registry                 |
+| `https://kas.local.bruj0.net`              | `root` / OpenBao secret                            | GitLab Agent Server (KAS)                 |
+| `https://minio.local.bruj0.net`            | `root` / OpenBao secret                            | MinIO (LFS, artifacts, packages)          |
+| `https://openbao.local.bruj0.net`          | root token in `infra/secrets/openbao-init.json`    | OpenBao UI                                |
+
+The hostnames resolve on the **developer's machine** via
+`/etc/hosts` (one-time, see step 2 above). Inside the cluster,
+pods use Service DNS (`gitlab-webservice-default.gitlab.svc:8181`,
+`openbao.openbao.svc:8200`, etc.) — `*.local.bruj0.net` does
+**not** resolve in-cluster. See the matching rule in `AGENTS.md`.
 
 ## Conventions
 
@@ -144,19 +228,31 @@ at
 - **No shell scripts for non-trivial logic** — the spec rules shell out for
   Python. `infra/scripts/bootstrap/` is a class-based package (SOLID)
   composed of single-responsibility classes wired together by
-  `app.py`. `infra/scripts/pki.py` is the only remaining monolith (it
-  predates the package and only runs `openssl`).
+  `app.py`.
+- **uv is the Python toolchain.** The bootstrap is a uv project
+  (`pyproject.toml` + `uv.lock` committed, `.venv/` gitignored).
+  The two installed entry points are `blueprint-bootstrap`
+  (install CLI) and `blueprint-secrets` (post-install helper for
+  reading OpenBao secrets + opening the UI). Don't reintroduce
+  system-level `pip install` — the virtualenv is per-checkout and
+  rebuildable from the lockfile.
 - **Pinned versions live in one place.** `infra/scripts/bootstrap/VERSIONS.json`
   is the single source of truth for every tool version, helm chart
   version, and helm repository URL. No class hardcodes a version.
 - **Helm charts are cached locally.** Charts are downloaded into
   `infra/helm-charts/` and installed from that path so installs work
   without re-fetching.
-- **No plaintext secrets in git.** Phase 1's CA private key is the only
-  artifact that qualifies, and it lives under `infra/tls/private/`
-  (gitignored). Phase 2 moves all secrets into OpenBao.
+- **No plaintext secrets in git.** Phase 2 stores the OpenBao
+  unseal keys + root token in `infra/secrets/openbao-init.json`
+  (gitignored, mode 0600) and pushes the values that matter
+  (GitLab initial root password, Runner registration token) into
+  OpenBao at `secret/gitlab/...`. Read them back via
+  `uv run blueprint-secrets read <path> <key>`.
 - **TLS is local-CA now, Let's Encrypt later.** Public LE can't validate
-  `*.local.bruj0.net`. Phase 2 swaps the issuer once public DNS is
-  delegated. The wrapper (Traefik, IngressRoute, etc.) never changes.
+  `*.local.bruj0.net`. The GitLab chart's pre-install cfssl Job
+  mints the wildcard cert for us today; once public DNS is
+  delegated, we swap to cert-manager-issued certs without
+  changing anything about the bootstrap or the chart values.
 - **Reproducibility first.** Every step is idempotent. Re-running
-  `bootstrap.py --phase 1` is a no-op when nothing has changed.
+  `uv run blueprint-bootstrap --phase 1` is a no-op when nothing
+  has changed.

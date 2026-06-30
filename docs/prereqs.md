@@ -1,7 +1,8 @@
 # Host prerequisites
 
 Phase 1 runs on any Linux or macOS host that can run Docker and `kind`. The
-`bootstrap.py` helper will detect what's missing and install it for you.
+`uv run blueprint-bootstrap --phase 1 --check` helper will detect what's
+missing and install it for you.
 
 ## Supported operating systems
 
@@ -31,27 +32,33 @@ pipeline doesn't care how you got them.
 
 | Port | Purpose                                                  |
 | ---- | -------------------------------------------------------- |
-| 80   | Reserved for Phase 2 Traefik HTTP entrypoint            |
-| 443  | Reserved for Phase 2 Traefik HTTPS entrypoint           |
+| 80   | Reserved for Phase 2 Envoy Gateway HTTP entrypoint      |
+| 443  | Reserved for Phase 2 Envoy Gateway HTTPS entrypoint     |
 | 6443 | kind control-plane API (mapped to a random host port)   |
 
-## Toolchain (any of these installable via `bootstrap.py`)
+## Toolchain (any of these installable via `uv run blueprint-bootstrap --phase 1 --check`)
 
 - `docker` — container runtime for kind nodes
 - `kubectl` — cluster access
 - `kind` ≥ 0.27 — node image: `kindest/node:v1.31.0`
 - `helm` ≥ 3 — pinned for Phase 2 (not used in Phase 1)
 - `tofu` ≥ 1.6 (OpenTofu) — IaC runtime
-- `openssl` ≥ 3 — PKI generation in `pki.py`
+- `uv` ≥ 0.5 — Python project manager (used to install the
+  bootstrap's deps; see `pyproject.toml` + `uv.lock`)
 
 ## DNS
 
 Phase 1 does **not** require public DNS. `*.local.bruj0.net` is intended to
-resolve to `127.0.0.1` once you add a hosts entry on your laptop:
+resolve to `127.0.0.1` once you add a hosts entry on your laptop
+(you'll do this as part of Phase 2's post-install checklist — see
+[README.md](../README.md)):
 
 ```
-127.0.0.1  gitlab.local.bruj0.net traefik.local.bruj0.net openbao.local.bruj0.net
+127.0.0.1  gitlab.local.bruj0.net registry.local.bruj0.net \
+           kas.local.bruj0.net minio.local.bruj0.net \
+           openbao.local.bruj0.net
 ```
 
-Phase 2 will install Traefik and Gateway API. Until then, the kubeconfig is
-all you need.
+Phase 2 will install Envoy Gateway (sub-charted by the GitLab chart)
+and mint the self-signed wildcard via the chart's pre-install cfssl
+Job. Until then, the kubeconfig is all you need.

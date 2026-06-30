@@ -1,7 +1,7 @@
 # Phase 1 — Provision the local kind cluster
 
 This phase provisions a 5-node `kind` cluster via OpenTofu. It does **not**
-install GitLab, OpenBao, Traefik, or any application — those land in
+install GitLab, OpenBao, Envoy, or any application — those land in
 Phase 2. Keeping the phases scoped this way lets you verify Phase 1 in
 isolation before moving on.
 
@@ -13,51 +13,57 @@ isolation before moving on.
 - Per-node `extraMounts` from `blueprint/data/nodeN` → `/var/local/nodeN`
 - Shared `extraMounts` from `blueprint/data/shared` → `/var/local/shared`
   on every node (incl. control-plane)
-- A self-signed local CA + wildcard cert for `*.local.bruj0.net` written
-  under `blueprint/infra/tls/`. **No Let's Encrypt automation** — the host
-  is `127.0.0.1`-only and LE cannot validate that hostname from a public
-  CA. Phase 2 swaps the local-CA issuer for a DNS-01 issuer once public
-  DNS for `local.bruj0.net` is delegated.
-- Host ports `80` and `443` on the control-plane reserved for the Phase 2
-  Traefik entrypoint.
+- Host ports `80` and `443` on the control-plane reserved for the
+  Phase 2 Envoy Gateway entrypoint (forwarded to the cluster by kind).
+- **TLS is NOT part of Phase 1** anymore — the GitLab chart's pre-install
+  cfssl Job mints the `*.local.bruj0.net` wildcard during Phase 2.
+  Phase 1 only creates the kind cluster.
 
 ## One-shot preparation
 
 ```sh
 cd blueprint
-python3 infra/scripts/bootstrap.py --phase 1
+
+# 0. One-time: install the bootstrap's Python deps into .venv/.
+uv sync
+
+# 1. Run the full preparation (installs prereqs, writes `tofu.tfvars`,
+#    downloads OpenTofu providers, caches the Headlamp chart). Bootstrap
+#    prints the next commands YOU run.
+uv run blueprint-bootstrap --phase 1
 ```
 
-The bootstrap **provisions configuration** (prereqs, PKI, `tofu.tfvars`,
+The bootstrap **provisions configuration** (prereqs, `tofu.tfvars`,
 downloaded providers, Headlamp chart cache) and **prints the exact
 next commands YOU run** to actually apply the cluster. Per spec rule,
 bootstrap never invokes `tofu apply` itself.
 
-Re-running `bootstrap.py --phase 1` is idempotent — it skips steps that
-already succeeded (e.g. the Headlamp chart isn't re-downloaded if it's
-already on disk, `tofu init` is a no-op when providers are present).
+Re-running `uv run blueprint-bootstrap --phase 1` is idempotent — it
+skips steps that already succeeded (e.g. the Headlamp chart isn't
+re-downloaded if it's already on disk, `tofu init` is a no-op when
+providers are present).
 
 ## Manual step-by-step
 
 ```sh
-cd blueprint/infra
+cd blueprint
 
 # 1. Check prereqs without installing or provisioning anything
-python3 scripts/bootstrap.py --phase 1 --check
+uv run blueprint-bootstrap --phase 1 --check
 
-# 2. Run the full preparation (installs prereqs, mints PKI, downloads
-#    OpenTofu providers, caches the Headlamp chart). Bootstrap prints
-#    the next commands YOU run.
-python3 scripts/bootstrap.py --phase 1
+# 2. Run the full preparation (installs prereqs, writes tfvars,
+#    downloads OpenTofu providers, caches the Headlamp chart).
+#    Bootstrap prints the next commands YOU run.
+uv run blueprint-bootstrap --phase 1
 
 # 3. YOU inspect the plan, then YOU apply
-tofu -chdir=tofu plan
-tofu -chdir=tofu apply -auto-approve
+tofu -chdir=infra/tofu plan
+tofu -chdir=infra/tofu apply -auto-approve
 
 # 4. YOU install Headlamp into the cluster
-KUBECONFIG=$PWD/tofu/kubeconfig \
+KUBECONFIG=$PWD/infra/tofu/kubeconfig \
   helm upgrade --install headlamp \
-    $PWD/../helm-charts/headlamp-0.43.0.tgz \
+    $PWD/infra/helm-charts/headlamp-0.43.0.tgz \
     --namespace headlamp --create-namespace --wait --set service.type=NodePort
 ```
 
@@ -83,9 +89,6 @@ docker exec kind-cicd-control-plane  ls /var/local/shared
 for n in node1 node2 node3 node4; do
   docker exec "kind-cicd-worker-$n" ls "/var/local/$n" || true
 done
-
-# Wildcard cert was issued by our local CA
-openssl x509 -in $PWD/tls/private/_.local.bruj0.net.crt -noout -subject -issuer -ext subjectAltName
 ```
 
 Expected outputs:
@@ -94,10 +97,10 @@ Expected outputs:
   `kind-cicd-worker2`, `kind-cicd-worker3`, `kind-cicd-worker4`
   (kind appends a numeric suffix only when duplicates exist).
 - `kubectl get nodes` shows 5 rows, all `STATUS = Ready`.
-- The leaf cert has `Subject: CN = *.local.bruj0.net` and
-  `Issuer: CN = bruj0-local-dev Root CA`, plus the SAN list:
-  `*.local.bruj0.net, local.bruj0.net, gitlab.local.bruj0.net,
-  traefik.local.bruj0.net, openbao.local.bruj0.net`.
+
+(Note: the Phase 1 cert mint is gone. The `*.local.bruj0.net`
+wildcard is created during Phase 2 by the GitLab chart's pre-install
+cfssl Job — see `.agents/skills/provision-gitlab/SKILL.md`.)
 
 ## Tearing it down
 
@@ -115,10 +118,10 @@ rm -rf blueprint/data/node{1,2,3,4,5}/* blueprint/data/shared/*
 ## Trade-offs
 
 - **Self-signed CA instead of Let's Encrypt.** Public LE cannot validate
-  `*.local.bruj0.net` because the host has no public DNS. The bootstrap
-  helper mints a local CA; Phase 2 swaps in cert-manager with DNS-01 once
-  the user delegates `local.bruj0.net`. The leaf key never leaves
-  `infra/tls/private/` and is gitignored.
+  `*.local.bruj0.net` because the host has no public DNS. The
+  GitLab chart's pre-install cfssl Job mints the wildcard during
+  Phase 2; we swap to cert-manager with DNS-01 once the user
+  delegates `local.bruj0.net` to a public resolver.
 - **Side-by-side kubeconfig.** We write a kubeconfig next to the tofu
   state (`infra/tofu/kubeconfig`) instead of mutating
   `~/.kube/config`. Use `KUBECONFIG=... kubectl ...` or `--kubeconfig=...`.
@@ -128,8 +131,8 @@ rm -rf blueprint/data/node{1,2,3,4,5}/* blueprint/data/shared/*
   documentation + node labels, not cgroups. If a node really does OOM the
   host will show it.
 - **Phase 1 does not bootstrap a `kubectl` context.** We don't want to
-  silently modify the host's global config. Phase 2 will offer an
-  opt-in `bootstrap.py --link` flag that merges the context.
+  silently modify the host's global config. `export KUBECONFIG=...` is
+  one line; that's the deal.
 - **state is local.** `terraform.tfstate` lives in
   `infra/tofu/terraform.tfstate` (gitignored). For a real CI pipeline
   you'd back this with an S3/GCS backend; for Phase 1 the reviewer can
