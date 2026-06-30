@@ -1,11 +1,6 @@
 ---
 name: provision-gitlab
-description: Install Phase 2 of the blueprint — GitLab, Runner, OpenBao, and
-  Traefik (with Gateway API). Use when the user says "phase 2", "install
-  gitlab", "provision gitlab", or asks to set up the GitLab/CI portion of
-  the blueprint. Drives the iteration loop: run `bootstrap.py --phase 2`,
-  observe, fix the installer or YAML references, re-run until smoke tests
-  pass.
+description: 'Install Phase 2 of the blueprint: GitLab, Runner, OpenBao, and Traefik (with Gateway API). Drives the iteration loop (run bootstrap.py --phase 2, observe, fix installer or YAML references, re-run until smoke tests pass).'
 ---
 
 # Provision GitLab (Phase 2)
