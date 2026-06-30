@@ -23,8 +23,10 @@ So we apply both:
 
   1. upstream gateway-api standard channel (v1.2.1)
   2. the chart's vendored experimental-channel CRDs + Envoy policy
-     CRDs (under infra/helm-charts/local-bruj0-net-gateway/../gateway-helm/crds
-     or extracted by us into infra/scripts/bootstrap/phase2/references/gateway-api-crds/)
+     CRDs (extracted by us into
+     infra/scripts/bootstrap/phase2/references/gateway-api-crds/ so
+     the install has no network dependency for the CRD set the
+     chart already shipped)
 
 `kubectl apply` is idempotent so re-runs are safe.
 """

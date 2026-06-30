@@ -18,9 +18,10 @@ on top of the `devops-take-home.md` assignment. It currently delivers
 **Phase 1 (cluster)** and **Phase 2 (GitLab stack)**:
 
 - **Phase 1**: 5-node `kind` cluster provisioned by OpenTofu, with
-  per-node and shared hostPath mounts, a self-signed wildcard cert for
-  `*.local.bruj0.net`, and a Headlamp dashboard chart pre-cached for
-  the user to install.
+  per-node and shared hostPath mounts, and a Headlamp dashboard
+  chart pre-cached for the user to install. The `*.local.bruj0.net`
+  wildcard cert is **not** part of Phase 1 — the GitLab chart
+  mints it during Phase 2 (see below).
 - **Phase 2**: GitLab CE + Runner + OpenBao installed end-to-end into
   the Phase-1 cluster via `uv run blueprint-bootstrap --phase 2`.
   The GitLab chart sub-installs Envoy Gateway as its managed ingress

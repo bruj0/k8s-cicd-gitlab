@@ -5,19 +5,18 @@ Phases:
      tree (tfvars, helm chart cache), and PRINTS the next commands. It
      never invokes `tofu apply`. (See `spec.md` rule: "The bootstrap
      application checks the system and provisions all the configuration
-     so a person can run it.") PKI is no longer minted here — cert-manager
-     inside the cluster mints the wildcard cert via the
-     `local-bruj0-net-ca` Helm chart in Phase 2.
+     so a person can run it.") PKI is no longer minted here — the
+     GitLab chart's pre-install cfssl Job mints the `*.local.bruj0.net`
+     wildcard cert during Phase 2.
 
-  2. Bootstrap ACTUALLY installs Phase 2 (OpenBao + GitLab + Runner +
-     cert-manager + the `local-bruj0-net-ca` chart + the
-     `local-bruj0-net-gateway` chart). The reverse proxy is **not** a
-     separate install — the GitLab chart's
-     `global.gatewayApi.installEnvoy: true` in `VERSIONS.json` makes the
-     chart deploy Envoy Gateway (via its `gateway-helm` sub-chart)
-     when GitLab is installed. The spec rule from Phase 1 was scoped to
-     OpenTofu; helm/kubectl ARE applied by the bootstrap so iteration
-     can test results. Every step is idempotent so re-runs are safe.
+  2. Bootstrap ACTUALLY installs Phase 2 (Gateway API CRDs + OpenBao +
+     GitLab + Runner). The reverse proxy is **not** a separate install —
+     the GitLab chart's `global.gatewayApi.installEnvoy: true` in
+     `VERSIONS.json` makes the chart deploy Envoy Gateway (via its
+     `gateway-helm` sub-chart) when GitLab is installed. The spec rule
+     from Phase 1 was scoped to OpenTofu; helm/kubectl ARE applied by
+     the bootstrap so iteration can test results. Every step is
+     idempotent so re-runs are safe.
 
 Run vs read at a glance:
 
@@ -27,10 +26,10 @@ Run vs read at a glance:
     [user]       inspects `tofu plan`, runs `tofu apply`, runs
                  `kubectl get nodes`, runs `helm install` for Headlamp
                  (Phase 1's user handoff).
-    [bootstrap]  installs OpenBao + GitLab (with Envoy Gateway sub-chart
-                 + cert-manager sub-chart) + our SelfSigned CA + our
-                 wildcard Gateway + Runner, in that order, with
-                 idempotency probes + retry-safe steps (Phase 2).
+    [bootstrap]  installs Gateway API CRDs + OpenBao + GitLab (with
+                 Envoy Gateway sub-chart + chart-managed self-signed
+                 cert) + Runner, in that order, with idempotency
+                 probes + retry-safe steps (Phase 2).
 
 Every line printed by this app is prefixed `[bootstrap]` or `[user]`
 so the boundary between the two is unambiguous in the terminal.
@@ -76,10 +75,11 @@ class CliArgs:
 def parse_args(argv: list[str] | None = None) -> CliArgs:
     ap = argparse.ArgumentParser(
         description=(
-            "Blueprint bootstrap. Phase 1 prepares the working tree (prereqs, "
-            "PKI, tfvars, helm chart cache) and prints the next commands. "
-            "Phase 2 installs GitLab + Runner + OpenBao + Traefik end-to-end. "
-            "Per spec, Phase 1 bootstrap never runs OpenTofu."
+            "Blueprint bootstrap. Phase 1 prepares the working tree "
+            "(prereqs, tfvars, helm chart cache) and prints the next "
+            "commands. Phase 2 installs GitLab + Runner + OpenBao + "
+            "the chart-managed Envoy Gateway end-to-end. Per spec, "
+            "Phase 1 bootstrap never runs OpenTofu."
         )
     )
     ap.add_argument(
@@ -110,10 +110,9 @@ class BootstrapApp:
 
     Lifecycle (printed in order to the terminal):
 
-        [bootstrap]  Step 1/4  Install missing host prereqs
-        [bootstrap]  Step 2/4  Mint local CA + wildcard cert
-        [bootstrap]  Step 3/4  `tofu init` + `tofu validate` (no apply)
-        [bootstrap]  Step 4/4  Cache Headlamp chart (no install)
+        [bootstrap]  Step 1/3  Install any missing host prereqs
+        [bootstrap]  Step 2/3  `tofu init` + `tofu validate` (no apply)
+        [bootstrap]  Step 3/3  Cache Headlamp chart (no install)
         [user]       Step 1/6  Inspect `tofu plan` (read it carefully)
         [user]       Step 2/6  Run `tofu apply` (this provisions the cluster)
         [user]       Step 3/6  Verify 5 nodes are Ready with `kubectl get nodes`
@@ -121,7 +120,7 @@ class BootstrapApp:
         [user]       Step 5/6  Discover the Headlamp URL (NODE_PORT + NODE_IP)
         [user]       Step 6/6  Mint a Headlamp login token with `kubectl create token`
 
-    The split between Step 1-4 (the app does it) and Step 1-6 (you do it)
+    The split between Step 1-3 (the app does it) and Step 1-6 (you do it)
     is the spec rule made visible. Re-running is safe and idempotent.
 
     The `--user` flag short-circuits the pipeline and only prints the
@@ -253,8 +252,9 @@ class BootstrapApp:
             self._app("    2. run `tofu init` + `tofu validate` (NOT `tofu apply`)")
             self._app("    3. cache the Headlamp chart under infra/helm-charts/")
             self._app("    4. print the commands YOU then run manually")
-            self._app("    (PKI is no longer minted here — cert-manager in Phase 2")
-            self._app("     mints the wildcard cert via local-bruj0-net-ca chart.)")
+            self._app("    (PKI is no longer minted here — the GitLab chart's")
+            self._app("     pre-install cfssl Job mints the *.local.bruj0.net wildcard")
+            self._app("     cert during Phase 2.)")
         self.log.info("")
 
         if not is_supported(family) and not (args.check or args.skip_install) and not args.user:

@@ -10,8 +10,10 @@ isolation before moving on.
 - 1 control-plane node (`control-plane-1`, 4 GB)
 - 3 worker nodes for GitLab services (`gitlab-1..3`, 4 GB each)
 - 1 worker node for the GitLab Runner (`runner`, 8 GB)
-- Per-node `extraMounts` from `blueprint/data/nodeN` → `/var/local/nodeN`
-- Shared `extraMounts` from `blueprint/data/shared` → `/var/local/shared`
+- Per-node `extraMounts` from `infra/data/nodeN` → `/var/local/nodeN`
+  (the `data_root` variable in `infra/tofu/tofu.tfvars.example`
+  defaults to `../data`, which resolves to `infra/data/`)
+- Shared `extraMounts` from `infra/data/shared` → `/var/local/shared`
   on every node (incl. control-plane)
 - Host ports `80` and `443` on the control-plane reserved for the
   Phase 2 Envoy Gateway entrypoint (forwarded to the cluster by kind).
@@ -108,12 +110,17 @@ cfssl Job — see `.agents/skills/provision-gitlab/SKILL.md`.)
 tofu -chdir=blueprint/infra/tofu destroy -auto-approve
 ```
 
-`data/*` is on the host so it survives cluster destroy. Delete it
+`infra/data/*` is on the host so it survives cluster destroy. Delete it
 manually if you want a clean slate:
 
 ```sh
-rm -rf blueprint/data/node{1,2,3,4,5}/* blueprint/data/shared/*
+rm -rf infra/data/node{1,2,3,4}/* infra/data/shared/*
 ```
+
+(`blueprint/data/` exists too — a tracked placeholder with only
+`.gitkeep` files. The kind cluster does **not** mount it. The
+real hostPath source is `infra/data/`, configured by the
+`data_root` variable in `infra/tofu/tofu.tfvars`.)
 
 ## Trade-offs
 
