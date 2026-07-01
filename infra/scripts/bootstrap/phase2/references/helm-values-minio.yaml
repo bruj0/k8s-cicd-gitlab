@@ -1,0 +1,56 @@
+# minio/minio values for chart 10.x's external object storage.
+#
+# Minimum-resource architecture: single pod, no distributed mode, no
+# erasure coding. Pinned to the hostPath PV `pv-minio-data` created
+# by phase2/stable_storage.py (Flavor A `existing_claim`).
+#
+# Resources: 500m CPU / 512Mi RAM. MinIO is small for GitLab's bucket
+# scale in a single-node blueprint. Tune if your CI/CD produces heavy
+# artifact volume.
+---
+mode: standalone
+
+# Single replica in standalone mode (chart enforces this but
+# explicit is better than implicit).
+replicas: 1
+
+# The chart auto-generates `minio-root-user` + `minio-root-password`
+# Secrets via `secretKeys`. We mirror them to infra/secrets/ in
+# bootstrap/phase2/minio.py for the GitLab chart values to consume.
+rootUser: ""
+rootPassword: ""
+
+persistence:
+  enabled: true
+  size: 20Gi
+  storageClass: manual
+  accessMode: ReadWriteOnce
+  existingClaim: minio-data
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Disable the metrics exporter — matches the no-monitoring rule
+# used everywhere else in the blueprint. The chart also exposes
+# a Prometheus port by default; turning it off saves resources.
+metrics:
+  enabled: false
+
+# Default MinIO services:
+#   - minio.<ns>.svc:9000  → S3 API (consumed by GitLab chart)
+#   - minio.<ns>.svc:9001  → Console UI (optional, not exposed externally
+#     in the blueprint; admin can kubectl port-forward to inspect)
+service:
+  type: ClusterIP
+
+# Don't auto-create buckets — bootstrap creates them in minio.py
+# so we control the bucket list from one place.
+buckets: []
+
+consoleService:
+  type: ClusterIP

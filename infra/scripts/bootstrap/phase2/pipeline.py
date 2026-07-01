@@ -26,21 +26,45 @@ Step order matters:
                         registry-tls + kas-tls + minio-tls).
                         MUST run before the GitLab chart install so
                         the listener `certificateRefs` resolve.
-    7. persistent       restore chart-managed Secrets (postgres/
-       secrets          redis/minio/rails/gitaly/kas passwords) from
-                        a host-side snapshot, so the on-disk data
-                        in the preserved PVs keeps matching the
-                        chart's expected credentials. Skipped on
-                        fresh installs (no snapshot yet).
-    8. GitLab           chart + chart-managed Gateway + chart-managed
-                        HTTPRoutes (gitlab/registry/kas/minio).
-                        (The chart's own self-signed-cert Job is
-                        skipped because its `gitlab.ingress.tls.configured`
-                        helper returns "true" when Gateway API is on;
-                        we override `global.ingress.tls.secretName` in
-                        helm-values to make that explicit, then mint
-                        the Secret in step 6.)
-    9. GitLab Runner    install with the runner registration token from OpenBao
+    7. CloudNativePG    install operator + Cluster/postgresql +
+                        bootstrap the GitLab (`gitlabhq_production`)
+                        and OpenBao (`openbao`) databases. Chart 10.x
+                        no longer bundles PostgreSQL, so this is now
+                        a first-class install step.
+    8. Redis            install single-node bitnami/redis +
+                        snapshot the auto-generated password Secret
+                        to infra/secrets/. Chart 10.x no longer
+                        bundles Redis.
+    9. MinIO            install standalone minio + create the
+                        GitLab object-store buckets (lfs, artifacts,
+                        uploads, packages, backups, terraform-state,
+                        ci-secure-files, pages, dependency-proxy,
+                        snippets) via in-cluster `mc`. Chart 10.x no
+                        longer bundles object storage.
+   10. OpenBao          install + init + unseal. The chart-bundled
+                        OpenBao subchart in GitLab uses the PostgreSQL
+                        cluster we just stood up (via
+                        `global.openbao.psql.host`), so the user
+                        password is in `infra/secrets/cnpg-role-passwords.json`.
+   11. persistent       restore chart-managed Secrets (rails/gitaly/
+       secrets          kas passwords, initial-root-password, etc.)
+                        from a host-side snapshot, so the on-disk
+                        data in the preserved PVs keeps matching
+                        the chart's expected credentials. PG/Redis/MinIO
+                        passwords are NOT in this snapshot anymore —
+                        they live in cnpg-role-passwords.json +
+                        redis-password.txt + minio-root-{user,password}.txt.
+   12. GitLab           chart + chart-managed Gateway + chart-managed
+                        HTTPRoutes (gitlab/registry/kas/minio) +
+                        chart-bundled OpenBao subchart connected
+                        to the external PG/Redis/MinIO we just
+                        stood up.
+   13. persistent       snapshot any chart-managed Secrets that aren't
+       secrets snapshot  PG/Redis/MinIO credentials (those have their
+                        own infra/secrets/ files already) — keeps the
+                        `gitlab-runtime-secrets.yaml` snapshot small
+                        and accurate.
+   14. GitLab Runner    install with the runner registration token from OpenBao
 
 The GitLab chart would normally own the TLS path: with
 `configureCertmanager: false` it mints a self-signed wildcard cert
@@ -84,12 +108,13 @@ class Phase2Pipeline:
         log = self.log
         log.info("")
         log.info("=" * 72)
-        log.info("  [bootstrap] Phase 2: install GitLab + Runner + OpenBao")
+        log.info("  [bootstrap] Phase 2: install CloudNativePG + Redis + MinIO +")
+        log.info("                 OpenBao + GitLab + Runner (chart 10.x)")
         log.info("    (chart-managed Gateway + Envoy sub-chart +")
         log.info("     bootstrap-minted self-signed wildcard cert +")
         log.info("     local-path StorageClass backed by infra/data/shared/ +")
         log.info("     stable PV/PVC pairs so cluster recreate preserves identity +")
-        log.info("     restored chart-managed Secrets so PostgreSQL/Redis/MinIO")
+        log.info("     restored chart-managed Secrets so chart-bundled components")
         log.info("     keep matching the on-disk data)")
         log.info("=" * 72)
         log.info("")
@@ -99,6 +124,9 @@ class Phase2Pipeline:
             self._step_gateway_crds()
             self._step_local_path()
             self._step_stable_storage()
+            self._step_cnpg()
+            self._step_redis()
+            self._step_minio()
             self._step_openbao()
             self._step_wildcard_certs()
             self._step_persistent_secrets_restore()
@@ -141,7 +169,7 @@ class Phase2Pipeline:
     # ---------- pre-flight ----------
 
     def _step_preflight(self) -> None:
-        self.log.info("[bootstrap] Step 1/7  Pre-flight (cluster reachable)")
+        self.log.info("[bootstrap] Step 1/13  Pre-flight (cluster reachable)")
         self.runner.run(["kubectl", "cluster-info"], check=True)
         self.runner.run(["helm", "version", "--short"], check=True)
         self.log.ok("cluster + helm are reachable")
@@ -150,7 +178,7 @@ class Phase2Pipeline:
 
     def _step_gateway_crds(self) -> None:
         self.log.info(
-            "[bootstrap] Step 2/7  Install Gateway API CRDs "
+            "[bootstrap] Step 2/13  Install Gateway API CRDs "
             "(upstream standard + chart-shipped Envoy CRDs)"
         )
         self.installers.crds.install()
@@ -160,7 +188,7 @@ class Phase2Pipeline:
 
     def _step_local_path(self) -> None:
         self.log.info(
-            "[bootstrap] Step 3/7  Install rancher/local-path-provisioner "
+            "[bootstrap] Step 3/13  Install rancher/local-path-provisioner "
             "+ mark `local-path` as the default StorageClass + patch "
             "the provisioner to write PVs to /var/local/shared "
             "(chart PVCs land on infra/data/shared/)"
@@ -172,18 +200,59 @@ class Phase2Pipeline:
 
     def _step_stable_storage(self) -> None:
         self.log.info(
-            "[bootstrap] Step 4/7  Pre-create stable PV/PVC pairs for "
-            "OpenBao + GitLab sub-components (so `tofu destroy && "
-            "tofu apply` preserves identity — chart subcomponents "
-            "are pinned to these via `existingClaim`)"
+            "[bootstrap] Step 4/13  Pre-create stable PV/PVC pairs for "
+            "CloudNativePG + Redis + MinIO + OpenBao + Gitaly (so "
+            "`tofu destroy && tofu apply` preserves identity — chart "
+            "10.x no longer bundles these, so they're pinned here)"
         )
         self.installers.stable_storage.install()
-        self.log.ok("Stable PV/PVC pairs are in place (OpenBao, GitLab subcharts)")
+        self.log.ok("Stable PV/PVC pairs are in place (cnpg / redis / minio / openbao / gitaly)")
+
+    # ---------- CloudNativePG (operator + Cluster + DB bootstrap) ----------
+
+    def _step_cnpg(self) -> None:
+        self.log.info(
+            "[bootstrap] Step 5/13  Install CloudNativePG operator "
+            "+ Cluster/postgresql (single instance, 8Gi) + bootstrap "
+            "the `gitlabhq_production` + `openbao` databases. "
+            "Chart 10.x consumes this via `global.psql.host`."
+        )
+        self.installers.cnpg.install()
+        self.log.ok("CloudNativePG + databases are up (git, openbao roles provisioned)")
+
+    # ---------- Redis (single-node bitnami chart) ----------
+
+    def _step_redis(self) -> None:
+        self.log.info(
+            "[bootstrap] Step 6/13  Install single-node Redis "
+            "(bitnami/redis, architecture=standalone, no replicas, "
+            "no Sentinel). Chart 10.x consumes this via "
+            "`global.redis.host`. Password snapshot to "
+            "infra/secrets/redis-password.txt."
+        )
+        self.installers.redis.install()
+        self.log.ok("Redis is up + password snapshot saved")
+
+    # ---------- MinIO (standalone single-pod minio chart) ----------
+
+    def _step_minio(self) -> None:
+        self.log.info(
+            "[bootstrap] Step 7/13  Install standalone MinIO "
+            "+ create GitLab object-store buckets via in-cluster `mc`. "
+            "Chart 10.x consumes this via "
+            "`appConfig.object_store.<bucket>.connection`."
+        )
+        self.installers.minio.install()
+        self.log.ok("MinIO is up + 10 GitLab buckets provisioned")
 
     # ---------- openbao ----------
 
     def _step_openbao(self) -> None:
-        self.log.info("[bootstrap] Step 5/8  Install + initialise + unseal OpenBao")
+        self.log.info(
+            "[bootstrap] Step 8/13  Install + initialise + unseal OpenBao "
+            "(uses the PostgreSQL cluster we just stood up as its "
+            "storage backend)"
+        )
         self.installers.openbao.install()
         self.log.ok("OpenBao is initialised and unsealed")
 
@@ -191,7 +260,7 @@ class Phase2Pipeline:
 
     def _step_wildcard_certs(self) -> None:
         self.log.info(
-            "[bootstrap] Step 6/9  Mint self-signed wildcard cert for "
+            "[bootstrap] Step 9/13  Mint self-signed wildcard cert for "
             "*.local.bruj0.net and materialise the four Gateway listener Secrets "
             "(the chart's own self-signed-cert Job is skipped when Gateway API is on)"
         )
@@ -202,11 +271,11 @@ class Phase2Pipeline:
 
     def _step_persistent_secrets_restore(self) -> None:
         self.log.info(
-            "[bootstrap] Step 7/9  Restore chart-managed Secrets from the "
-            "host-side snapshot (postgres/redis/minio/rails/gitaly/kas "
-            "passwords) so the chart picks up the same credentials as the "
-            "data already in the preserved PVs — without this, PostgreSQL "
-            "logs `password authentication failed` after every recreate"
+            "[bootstrap] Step 10/13  Restore chart-managed Secrets from the "
+            "host-side snapshot (rails/gitaly/kas passwords, initial-root-password, "
+            "etc.) so the chart picks up the same credentials as the data already "
+            "in the preserved PVs. PG/Redis/MinIO passwords are NOT in this snapshot — "
+            "they live in their own infra/secrets/ files."
         )
         self.installers.persistent_secrets.restore()
 
@@ -214,17 +283,17 @@ class Phase2Pipeline:
 
     def _step_gitlab(self) -> None:
         self.log.info(
-            "[bootstrap] Step 8/9  Install GitLab "
-            "(bundles Envoy Gateway sub-chart; Gateway listeners resolve "
-            "against the Secrets we just minted; chart sees the restored "
-            "Secret data and reuses it instead of re-minting)"
+            "[bootstrap] Step 11/13  Install GitLab "
+            "(bundles Envoy Gateway sub-chart + chart-bundled OpenBao "
+            "subchart; chart sees the external PG/Redis/MinIO we stood "
+            "up + the wildcard cert Secrets we minted)"
         )
         self.installers.gitlab.install()
         self.log.ok("GitLab installed + credentials captured")
 
     def _step_persistent_secrets_snapshot(self) -> None:
         self.log.info(
-            "[bootstrap] Step 8b/9  Snapshot chart-managed Secrets to "
+            "[bootstrap] Step 12/13  Snapshot chart-managed Secrets to "
             "infra/secrets/gitlab-runtime-secrets.yaml for next cluster recreate"
         )
         self.installers.persistent_secrets.snapshot()
@@ -233,7 +302,7 @@ class Phase2Pipeline:
 
     def _step_runner(self) -> None:
         self.log.info(
-            "[bootstrap] Step 9/9  Install GitLab Runner "
+            "[bootstrap] Step 13/13  Install GitLab Runner "
             "(registers against in-cluster Service DNS)"
         )
         self.installers.runner.install()

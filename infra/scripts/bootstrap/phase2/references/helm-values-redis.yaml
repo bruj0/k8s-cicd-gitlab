@@ -1,0 +1,57 @@
+# bitnami/redis values for chart 10.x's external Redis.
+#
+# Minimum-resource architecture: single master, no replicas, no
+# Sentinel. Pinned to the hostPath PV `pv-redis-data` created by
+# phase2/stable_storage.py (Flavor A `existing_claim`).
+#
+# Why we override storageClass/size at the PVC level: the bitnami chart
+# would otherwise mint a fresh `pvc-<UUID>` on every install, losing
+# the RDB snapshot. By pinning to `pv-redis-data` we get the same
+# survival semantics we have for PostgreSQL/Gitaly/etc.
+#
+# Resources: 250m CPU / 256Mi RAM. Redis is small even at GitLab's
+# scale. Tune via chart values if your CI/CD workload grows.
+---
+architecture: standalone
+
+auth:
+  enabled: true
+  # The chart auto-generates a `redis-password` Secret. GitLab chart
+  # references this via global.redis.auth.existingSecret: redis-password.
+
+master:
+  persistence:
+    enabled: true
+    size: 4Gi
+    storageClass: manual
+    accessModes:
+      - ReadWriteOnce
+    existingClaim: redis-data
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+replica:
+  # Disable replica + Sentinel entirely — single-node deployment.
+  replicaCount: 0
+  persistence:
+    enabled: false
+
+sentinel:
+  enabled: false
+
+# No metrics exporter (matches the no-monitoring-everywhere-else rule).
+metrics:
+  enabled: false
+
+# Standard service configuration. The bitnami chart exposes
+# `redis-master.<ns>.svc:6379` which GitLab chart consumes via
+# `global.redis.host`.
+service:
+  type: ClusterIP
+  ports:
+    redis: 6379

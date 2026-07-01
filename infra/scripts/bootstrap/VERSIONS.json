@@ -63,7 +63,7 @@
       "name": "gitlab",
       "url": "https://charts.gitlab.io",
       "chart": "gitlab",
-      "chart_version": "9.11.7",
+      "chart_version": "10.1.1",
       "values_overrides": {
         "global": {
           "edition": "ce",
@@ -100,6 +100,27 @@
           }
         }
       }
+    },
+    "cloudnative-pg": {
+      "name": "cloudnative-pg",
+      "url": "https://cloudnative-pg.github.io/charts",
+      "chart": "cloudnative-pg",
+      "chart_version": "0.29.0",
+      "comment": "Operator for CloudNativePG. Installed once per cluster; manages Cluster/postgresql CRDs that GitLab chart 10.x (and chart-managed OpenBao v0.15.1) consume as external PostgreSQL."
+    },
+    "redis": {
+      "name": "redis",
+      "url": "https://charts.bitnami.com/bitnami",
+      "chart": "redis",
+      "chart_version": "27.0.13",
+      "comment": "Single-node Redis (master only, no replicas) for chart 10.x external Redis. The chart auto-generates a `redis-password` Secret which we then reference from `global.redis.auth.secret`."
+    },
+    "minio": {
+      "name": "minio",
+      "url": "https://charts.min.io/",
+      "chart": "minio",
+      "chart_version": "5.4.0",
+      "comment": "Standalone (single-node) MinIO for chart 10.x external object storage. GitLab chart creates ObjectBucketClaims against this MinIO for lfs/artifacts/uploads/packages/etc."
     }
   }
 }

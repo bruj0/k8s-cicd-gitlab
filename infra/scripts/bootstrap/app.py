@@ -153,8 +153,11 @@ class BootstrapApp:
         # Note: we build the Phase 2 installers directly rather than via
         # `installer_for()` because GitLab + Runner need an OpenBaoClient
         # injected, which `installer_for()` doesn't know about.
+        from .phase2.cloudnative_pg import CloudNativePGInstaller
         from .phase2.gitlab import GitlabInstaller
+        from .phase2.minio import MinIOInstaller
         from .phase2.openbao import OpenBaoInstaller
+        from .phase2.redis import RedisInstaller
         from .phase2.runner import GitLabRunnerInstaller
 
         # The init file doesn't exist yet during bootstrap construction;
@@ -177,6 +180,12 @@ class BootstrapApp:
             crds=GatewayCRDsInstaller(runner, paths, log),
             local_path=LocalPathProvisionerInstaller(runner, paths, log),
             stable_storage=StableStorageInstaller(runner, paths, log),
+            cnpg=CloudNativePGInstaller(
+                runner, paths, log,
+                operator=_build_cnpg_operator_installer(runner, paths, self.chart_cache, log),
+            ),
+            redis=_build_redis_installer(runner, paths, self.chart_cache, log),
+            minio=_build_minio_installer(runner, paths, self.chart_cache, log),
             openbao=OpenBaoInstaller(runner, paths, self.chart_cache, log),
             wildcard_certs=WildcardCertsInstaller(
                 runner, paths, log,
@@ -431,3 +440,40 @@ class BootstrapApp:
             self.log.err(f"  {TAG_BOOTSTRAP} {'docker_daemon':<{width}}  DOWN")
         else:
             self.log.ok(f"  {TAG_BOOTSTRAP} {'docker_daemon':<{width}}  OK")
+
+
+# ---------- Phase 2 chart-installer factories ----------
+#
+# These exist outside the class because the 3 Phase-2 installers
+# (cloudnative_pg, redis, minio) take a HelmAppInstaller as a
+# collaborator rather than constructing one inline. We build the
+# inner HelmAppInstaller here so the construction site is one
+# place (and the values files are referenced in a single spot
+# that a reviewer can grep for).
+
+def _build_cnpg_operator_installer(runner, paths, cache, log):
+    """Build the HelmAppInstaller for the CloudNativePG operator."""
+    from .app_installer import HelmAppInstaller, HelmAppSpec
+    from .phase2.cloudnative_pg import OPERATOR_NAMESPACE
+    return HelmAppInstaller(
+        runner, paths, cache, log,
+        HelmAppSpec(
+            repo_key="cloudnative-pg",
+            release="cnpg",
+            namespace=OPERATOR_NAMESPACE,
+            wait=True,
+            create_namespace=True,
+        ),
+    )
+
+
+def _build_redis_installer(runner, paths, cache, log):
+    """Build the single-node Redis installer."""
+    from .phase2.redis import build_redis_installer
+    return build_redis_installer(runner, paths, cache, log)
+
+
+def _build_minio_installer(runner, paths, cache, log):
+    """Build the standalone MinIO installer."""
+    from .phase2.minio import build_minio_installer
+    return build_minio_installer(runner, paths, cache, log)

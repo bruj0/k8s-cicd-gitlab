@@ -31,10 +31,17 @@ variable "data_root" {
 variable "node_shapes" {
   description = <<-EOT
     Ordered list of node definitions. Defaults to the spec:
-      - 3 gitlab workers @ 4Gi / 2 CPU
+      - 3 gitlab workers @ 8Gi / 4 CPU
       - 1 runner worker @ 8Gi / 4 CPU
       - 1 control-plane  @ 4Gi / 2 CPU
-    Roles: 'gitlab', 'runner', or 'control-plane'.
+    Roles: 'gitlab', 'runner', or 'control-plane'. The gitlab worker
+    memory bump from 4Gi → 8Gi (CPU 2 → 4) is required by GitLab chart
+    10.x (GitLab 19.x) which deploys Cloud Native architecture with
+    separate webservice, sidekiq, kas, gitaly, prometheus, plus the
+    chart-bundled OpenBao subchart — 4Gi per worker is below GitLab's
+    minimum reference architecture. With 3×8Gi + 1×8Gi + 1×4Gi, the
+    cluster totals 36Gi of advisory memory which the host can comfortably
+    back with the local-path StorageClass and chart-managed PVCs.
   EOT
 
   type = list(object({
@@ -45,9 +52,9 @@ variable "node_shapes" {
   }))
 
   default = [
-    { name = "gitlab-1", role = "gitlab", memory = "4Gi", cpu = 2 },
-    { name = "gitlab-2", role = "gitlab", memory = "4Gi", cpu = 2 },
-    { name = "gitlab-3", role = "gitlab", memory = "4Gi", cpu = 2 },
+    { name = "gitlab-1", role = "gitlab", memory = "8Gi", cpu = 4 },
+    { name = "gitlab-2", role = "gitlab", memory = "8Gi", cpu = 4 },
+    { name = "gitlab-3", role = "gitlab", memory = "8Gi", cpu = 4 },
     { name = "runner",   role = "runner", memory = "8Gi", cpu = 4 },
     { name = "control-plane-1", role = "control-plane", memory = "4Gi", cpu = 2 },
   ]

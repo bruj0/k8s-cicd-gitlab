@@ -12,11 +12,17 @@ Public surface:
         Phase2Installers    dataclass bundling every installer
 
     Per-component installers:
-        GatewayCRDsInstaller    upstream + Envoy Gateway API CRDs
-        OpenBaoInstaller        KV secret store + init/unseal
-        GitlabInstaller         the big chart + Envoy sub-chart
-                                (with post-install secret capture)
-        GitLabRunnerInstaller   registers against GitLab
+        GatewayCRDsInstaller     upstream + Envoy Gateway API CRDs
+        CloudNativePGInstaller   operator + Cluster/postgresql + DB
+                                 bootstrap (chart 10.x drops bundled PG)
+        RedisInstaller           single-node bitnami/redis (chart 10.x
+                                 drops bundled Redis)
+        MinIOInstaller           standalone minio + bucket bootstrap
+                                 (chart 10.x drops bundled object store)
+        OpenBaoInstaller         KV secret store + init/unseal
+        GitlabInstaller          the big chart + Envoy sub-chart
+                                 (with post-install secret capture)
+        GitLabRunnerInstaller    registers against GitLab
 
     Supporting classes:
         OpenBaoClient      hvac-backed client with auto port-forward
@@ -27,14 +33,20 @@ The iteration loop is documented in
 """
 
 from .catalog import Phase2Installers
+from .cloudnative_pg import (
+    CLUSTER_NAME, CLUSTER_NAMESPACE, CloudNativePGInstaller,
+    ROLE_PASSWORDS_FILE,
+)
 from .gateway import GATEWAY_API_STANDARD_URL, GatewayCRDsInstaller
 from .gitlab import GitlabCredentials, GitlabInstaller
 from .local_path_provisioner import LocalPathProvisionerInstaller
+from .minio import GITLAB_BUCKETS, MinIOInstaller
 from .openbao import OpenBaoInitOutput, OpenBaoInstaller
 from .persistent_secrets import (
     PERSISTED_GITLAB_SECRETS, PersistentSecretsInstaller,
 )
 from .pipeline import Phase2Pipeline
+from .redis import REDIS_NAMESPACE, RedisInstaller
 from .runner import GitLabRunnerInstaller
 from .secrets import OpenBaoClient
 from .stable_storage import STABLE_VOLUMES, StableStorageInstaller
@@ -50,6 +62,14 @@ __all__ = [
     "LocalPathProvisionerInstaller",
     "STABLE_VOLUMES",
     "StableStorageInstaller",
+    "CLUSTER_NAME",
+    "CLUSTER_NAMESPACE",
+    "CloudNativePGInstaller",
+    "ROLE_PASSWORDS_FILE",
+    "REDIS_NAMESPACE",
+    "RedisInstaller",
+    "GITLAB_BUCKETS",
+    "MinIOInstaller",
     "WILDCARD_LISTENER_SECRETS",
     "WildcardCertPaths",
     "WildcardCertsInstaller",

@@ -1,7 +1,12 @@
-# GitLab CE values for Phase 2.
+# GitLab CE values for Phase 2 (chart 10.1.1).
 #
-# The chart owns nearly everything. We override only what the chart
-# doesn't pick from the cluster's runtime context:
+# Chart 10.x dropped the bundled PostgreSQL, Redis, and MinIO charts.
+# This values file wires the GitLab chart to the three external
+# services we install ourselves (CloudNativePG + bitnami/redis +
+# minio/minio). The chart still owns nearly everything else —
+# Gateway API + Envoy, the OpenBao subchart, Gitaly, etc.
+#
+# What we override:
 #
 #   - global.hosts.domain / externalIP — the chart uses these to
 #      assemble `gitlab.<domain>` URLs and to bind the Gateway's
@@ -17,14 +22,30 @@
 #      cert for `*.local.bruj0.net` and stores it in Secret
 #      `gitlab-wildcard-tls` (plus `gitlab-wildcard-tls-ca`).
 #
+#   - global.psql.* — point at the external CloudNativePG cluster
+#      we install in step 5/13. The password comes from Secret
+#      `cnpg-role-passwords` field `gitlab` (deterministic
+#      SHA-256-derived, written by CloudNativePGInstaller.snapshot_passwords).
+#
+#   - global.redis.* — point at the bitnami/redis chart we install
+#      in step 6/13. Password comes from Secret `redis-password`.
+#
+#   - global.openbao.* — enable the chart-bundled OpenBao subchart
+#      (which powers the GitLab Secrets Manager feature). PostgreSQL
+#      backend pointed at the same external CloudNativePG cluster
+#      (using the `openbao` role).
+#
+#   - global.appConfig.object_store + per-bucket config — point
+#      all 10 GitLab buckets (lfs, artifacts, uploads, packages,
+#      backups, terraform-state, ci-secure-files, pages,
+#      dependency-proxy, snippets) at the standalone MinIO we
+#      install in step 7/13.
+#
 #   - gatewayApiResources.gateway.listeners.gitlab-web.tls.certificateRefs[0].name
 #      — chart default is `gitlab-tls` (cert-manager path). We
 #      override to `gitlab-wildcard-tls` (self-signed path) so the
 #      Gateway listener can find the Secret the chart's pre-install
 #      Job creates.
-#
-#   - resource caps on Postgres/Redis/MinIO to fit on the 3×4 GB
-#      kind workers.
 
 global:
   edition: ce
@@ -39,7 +60,7 @@ global:
     # helper `gitlab.ingress.tls.configured` returns "true" and
     # the chart skips its cfssl-self-sign pre-install Job (which
     # would race / fail on an invalid ACME email). We mint this
-    # secret ourselves in Phase 2 (step: cert generation) so
+    # secret ourselves in Phase 2 (step 9/13: wildcard certs) so
     # the Gateway listeners can resolve their certificateRefs.
     tls:
       secretName: gitlab-wildcard-tls
@@ -61,13 +82,136 @@ global:
   # needed — the bootstrap prints the port-forward command).
   gateway:
     enabled: true
-  # GitLab reads its initial root password from a Kubernetes
-  # Secret that the GitlabInstaller writes after install.
+
+  # --- External PostgreSQL (CloudNativePG cluster installed in step 5/13) ---
+  # The password comes from Secret `cnpg-role-passwords` field
+  # `gitlab`. That Secret is created by CloudNativePGInstaller
+  # (snapshot_passwords) with a deterministic SHA-256-derived
+  # password, so cluster recreate deterministically lands on the
+  # same credentials.
+  psql:
+    host: postgresql-cnpg-rw.postgresql.svc.cluster.local
+    port: 5432
+    username: gitlab
+    database: gitlabhq_production
+    applicationName: gitlab
+    password:
+      secret: cnpg-role-passwords
+      key: gitlab
+    # main/ci tasks share the same DB by default. We leave them
+    # empty so the chart falls back to the top-level psql settings.
+    main: {}
+    ci: {}
+
+  # --- External Redis (bitnami/redis chart installed in step 6/13) ---
+  # The password comes from Secret `redis-password`, auto-generated
+  # by the bitnami chart and snapshotted to infra/secrets/redis-password.txt
+  # by phase2/redis.py.
+  redis:
+    host: redis-master.redis.svc.cluster.local
+    port: 6379
+    auth:
+      enabled: true
+      secret: redis-password
+      key: redis-password
+    sentinelAuth:
+      enabled: false
+
+  # --- Chart-bundled OpenBao subchart (enables GitLab Secrets Manager) ---
+  # `global.openbao.enabled: true` flips on the bundled OpenBao
+  # subchart. The subchart auto-discovers the Chart-managed PG
+  # backend via `psql.host` (same CloudNativePG we configured
+  # above) and stores the GitLab Secrets Manager secrets there.
+  openbao:
+    enabled: true
+    host: ""
+    # httpAudit: telemetry for the Secrets Manager feature
+    httpAudit:
+      secret: openbao-http-audit-token
+      key: token
+    psql:
+      # Point the OpenBao subchart's PostgreSQL backend at the
+      # same CloudNativePG Cluster, using the `openbao` role
+      # we created in step 5/13. Password from the same
+      # cnpg-role-passwords Secret.
+      host: postgresql-cnpg-rw.postgresql.svc.cluster.local
+      port: 5432
+      database: openbao
+      username: openbao
+      password:
+        secret: cnpg-role-passwords
+        key: openbao
+
+  # --- External object storage (standalone MinIO installed in step 7/13) ---
+  # Chart 10.x drops the bundled minio chart, so we wire each
+  # bucket to the standalone MinIO we install in step 7/13.
+  #
+  # The `connection` Secret `gitlab-rails-storage` has a single
+  # key `connection` containing the S3 connection YAML (provider,
+  # aws_access_key_id, aws_secret_access_key, region, endpoint,
+  # path_style). Bootstrap creates this Secret in step 7/13
+  # from the MinIO root credentials snapshot.
   appConfig:
     secretBackend:
       type: kubernetes
       kubernetes:
         secretName: gitlab-secret-backend
+
+    # Consolidated object store config — used by lfs/artifacts/
+    # uploads/packages/etc. unless overridden below.
+    object_store:
+      enabled: true
+      proxy_download: true
+      connection:
+        secret: gitlab-rails-storage
+        key: connection
+
+    # Per-bucket overrides (only set bucket names — connection is
+    # inherited from the consolidated `object_store` above).
+    lfs:
+      enabled: true
+      bucket: gitlab-lfs
+    artifacts:
+      enabled: true
+      bucket: gitlab-artifacts
+    uploads:
+      enabled: true
+      bucket: gitlab-uploads
+    packages:
+      enabled: true
+      bucket: gitlab-packages
+    externalDiffs:
+      enabled: false
+    terraformState:
+      enabled: true
+      bucket: gitlab-terraform-state
+    ciSecureFiles:
+      enabled: true
+      bucket: gitlab-ci-secure-files
+    dependencyProxy:
+      enabled: true
+      bucket: gitlab-dependency-proxy
+
+    # Pages needs its own objectStore block (the consolidated
+    # `object_store.connection` is inherited only when
+    # `object_store.enabled` is true and pages doesn't override;
+    # set the bucket explicitly).
+    pages:
+      enabled: true
+      objectStore:
+        enabled: true
+        bucket: gitlab-pages
+
+  # Backup target — chart's toolbox backs up to its own bucket.
+  gitlab:
+    toolbox:
+      enabled: true
+      backups:
+        objectStorage:
+          backend: s3
+          config:
+            secret: gitlab-rails-storage
+            key: connection
 
 # Override the chart's default Gateway listener cert-ref. The chart
 # default (`gitlab-tls`) is the name the chart uses for the
@@ -82,61 +226,9 @@ gatewayApiResources:
           certificateRefs:
             - name: gitlab-wildcard-tls
 
-# Resource caps so GitLab fits on 3×4 GB kind workers.
-postgresql:
-  resources:
-    requests: { cpu: 100m, memory: 256Mi }
-    limits:   { cpu: 1000m, memory: 1Gi }
-  # Pin to the PV we pre-created in stable_storage.py so
-  # `tofu destroy && tofu apply` preserves PostgreSQL data
-  # (users, projects, CI variables). The PVC is
-  # `gitlab-postgresql` in the `gitlab` namespace.
-  primary:
-    persistence:
-      existingClaim: gitlab-postgresql
-
-redis:
-  resources:
-    requests: { cpu: 50m, memory: 64Mi }
-    limits:   { cpu: 500m, memory: 256Mi }
-  # Pin to the PV we pre-created in stable_storage.py so
-  # job queue and rate limits survive cluster recreates.
-  master:
-    persistence:
-      existingClaim: gitlab-redis
-
-minio:
-  resources:
-    requests: { cpu: 50m, memory: 64Mi }
-    limits:   { cpu: 250m, memory: 256Mi }
-  # Pin to the PV we pre-created in stable_storage.py (Flavor C:
-  # pvc_with_volume_name). The chart's minio_pvc.yaml creates a
-  # PVC named `gitlab-minio` and honours both `volumeName`
-  # (primary binding) and `matchLabels` (secondary safety net) on
-  # the PVC's spec — both pin to our pre-created PV. Without this
-  # the chart would create a fresh ephemeral PVC backed by the
-  # local-path provisioner and CI artifacts / LFS / uploads would
-  # be lost on every cluster recreate.
-  persistence:
-    volumeName: pv-gitlab-minio
-    # Same labels we stamp on the PV in stable_storage.py — the
-    # chart forwards these to the PVC's `spec.selector.matchLabels`.
-    matchLabels:
-      app: minio
-      release: gitlab
-      blueprint/stable-volume: minio
-      app.kubernetes.io/managed-by: blueprint-stable-storage
-
-prometheus:
-  server:
-    persistentVolume:
-      # Pin to the PV we pre-created in stable_storage.py so
-      # metrics history survives cluster recreates. The prometheus
-      # subchart (charts/prometheus/templates/deploy.yaml) keys off
-      # `persistentVolume.existingClaim` and creates a PVC named
-      # `gitlab-prometheus-server` when not pinned.
-      existingClaim: gitlab-prometheus-server
-
+# Resource caps so GitLab fits on 3×8 GB kind workers.
+# (Chart 19.x is heavier than 18.x — bumped from 4Gi to 8Gi in
+# infra/tofu/variables.tf.)
 gitlab:
   gitaly:
     persistence:
@@ -148,3 +240,48 @@ gitlab:
       # storage=default — these are stamped on the chart's
       # volumeClaimTemplate PVCs).
       storageClass: manual
+  # Reduce Gitaly + webservice + sidekiq defaults — we run a
+  # single instance of each (no HA, no autoscaling).
+  webservice:
+    deployment:
+      replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+  sidekiq:
+    deployment:
+      replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+
+# --- chart-bundled OpenBao subchart activation ---
+# The chart's top-level `openbao.install: false` default means the
+# subchart is OFF by default. Flip it on so the OpenBao subchart
+# deploys into the gitlab namespace and provides the Secrets
+# Manager API to the GitLab rails app.
+openbao:
+  install: true
+  # The subchart is configured via `global.openbao.*` (above).
+  # We disable its bundled PG/Redis because chart 10.x's OpenBao
+  # subchart shares the global `global.psql` and `global.redis`
+  # settings. With `global.openbao.psql.*` set, the subchart
+  # wires itself to the CloudNativePG cluster automatically.
+  workhorse: {}
+  # The OpenBao subchart exposes a chart-managed Gateway listener
+  # so the Secrets Manager UI/API is reachable via
+  # openbao.<domain>. The bootstrap does NOT expose it through the
+  # chart-managed Gateway (we use `kubectl port-forward` instead
+  # via `bootstrap secrets_cli ui`) because the chart's OpenBao
+  # listener config is incompatible with our Gateway API TLS path.
+  # So we disable the subchart's Gateway listener and rely on
+  # in-cluster port-forwarding.
+  ingress:
+    enabled: false
+  gatewayApi:
+    enabled: false
+  # Use static unsealing (the bootstrap generates the key into
+  # the chart-managed `gitlab-openbao-unseal-key` Secret on first
+  # install). See phase2/openbao.py + chart docs for the
+  # secret rotation story.
+  unseal:
+    static:
+      enabled: true

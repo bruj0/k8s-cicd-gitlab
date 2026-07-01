@@ -145,33 +145,45 @@ class StableVolume:
 #                  match those.
 STABLE_VOLUMES: tuple[StableVolume, ...] = (
     # --- Flavor A: existingClaim ------------------------------------
-    # GitLab PostgreSQL — users, projects, CI variables.
+    # External CloudNativePG data — the GitLab chart 10.x no longer
+    # bundles PostgreSQL, so we install cnpg ourselves and pin the
+    # operator's auto-minted data PVC (`postgresql-cnpg-data`) to a
+    # hostPath so `tofu destroy && apply` preserves the GitLab
+    # database. The PV pre-creates the PVC here (Flavor A), so the
+    # cnpg operator's StatefulSet picks up our existing PVC instead
+    # of minting a fresh one.
     StableVolume(
-        "existing_claim", "gitlab", "postgresql", "gitlab/postgresql", "8Gi",
-        pv_name="pv-gitlab-postgresql",
-        pvc_name="gitlab-postgresql",
-        chart_value_path="postgresql.primary.persistence.existingClaim",
-        chart_value="gitlab-postgresql",
+        "existing_claim", "postgresql", "cnpg", "postgresql/cnpg", "8Gi",
+        pv_name="pv-cnpg-data",
+        pvc_name="postgresql-cnpg-data",
+        # CloudNativePG Cluster exposes `storage.spec.pvcName` for
+        # this exact purpose. See:
+        # https://cloudnative-pg.io/documentation/1.30/cloudnative-pg.v1/#postgresql-api
+        chart_value_path="",
+        chart_value="",
     ),
-    # GitLab Redis — job queue, rate limits.
+    # External Redis data — chart 10.x consumes Redis externally
+    # via `global.redis.host`. The bitnami/redis chart creates a
+    # PVC named `redis-data` on install, which we pin to a hostPath
+    # via existingClaim.
     StableVolume(
-        "existing_claim", "gitlab", "redis", "gitlab/redis", "8Gi",
-        pv_name="pv-gitlab-redis",
-        pvc_name="gitlab-redis",
-        chart_value_path="redis.master.persistence.existingClaim",
-        chart_value="gitlab-redis",
+        "existing_claim", "redis", "data", "redis/data", "4Gi",
+        pv_name="pv-redis-data",
+        pvc_name="redis-data",
+        chart_value_path="",
+        chart_value="",
     ),
-    # Prometheus — metrics history. The prometheus subchart in the
-    # GitLab chart uses a Deployment (not StatefulSet by default)
-    # that creates a PVC named `gitlab-prometheus-server`. The
-    # values path is `server.persistentVolume.existingClaim` (NOT
-    # `server.persistence.existingClaim` like the older versions).
+    # External MinIO data — chart 10.x's bundled object storage is
+    # also dropped. We install minio/minio ourselves (standalone
+    # mode) and pin its PVC (`minio-data`) to a hostPath.
+    # The minio chart creates the PVC via `persistence.existingClaim`
+    # when set, so we pre-create both the PV and PVC here.
     StableVolume(
-        "existing_claim", "gitlab", "prometheus", "gitlab/prometheus", "8Gi",
-        pv_name="pv-gitlab-prometheus",
-        pvc_name="gitlab-prometheus-server",
-        chart_value_path="prometheus.server.persistentVolume.existingClaim",
-        chart_value="gitlab-prometheus-server",
+        "existing_claim", "minio", "data", "minio/data", "20Gi",
+        pv_name="pv-minio-data",
+        pvc_name="minio-data",
+        chart_value_path="",
+        chart_value="",
     ),
     # --- Flavor B: volumeClaimTemplate ------------------------------
     # OpenBao init keys + KV data — losing this loses the GitLab
@@ -209,29 +221,10 @@ STABLE_VOLUMES: tuple[StableVolume, ...] = (
         },
     ),
     # --- Flavor C: pvc_with_volume_name ------------------------------
-    # MinIO (S3 backing store for GitLab CI artifacts, LFS, uploads).
-    # The chart creates a PVC via minio_pvc.yaml (NOT a StatefulSet
-    # volumeClaimTemplate). The PVC supports `volumeName` +
-    # `matchLabels` for binding to a pre-created PV:
-    #   - `volumeName` pins the PV by name (canonical binding).
-    #   - `matchLabels` adds an extra safety net in case volumeName
-    #     gets stripped by a chart upgrade.
-    # We only create the PV here; the chart's minio_pvc.yaml creates
-    # the PVC on chart install and pins to our PV.
-    StableVolume(
-        "pvc_with_volume_name", "gitlab", "minio",
-        "gitlab/minio", "10Gi",
-        pv_name="pv-gitlab-minio",
-        pvc_name="gitlab-minio",
-        chart_value_path="minio.persistence.volumeName",
-        chart_value="pv-gitlab-minio",
-        selector_labels={
-            "app": "minio",
-            "release": "gitlab",
-            "app.kubernetes.io/managed-by": "blueprint-stable-storage",
-            "blueprint/stable-volume": "minio",
-        },
-    ),
+    # (Currently unused in chart 10.x. Kept in the schema for future
+    # chart-bundled services that mint their own PVC. As of chart
+    # 10.x the bundled PG / Redis / MinIO are gone — they all moved
+    # to operator-managed installs above.)
 )
 
 
