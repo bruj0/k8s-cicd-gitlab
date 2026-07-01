@@ -226,13 +226,71 @@ registry:
 # cert-manager-issued cert. With configureCertmanager: false the
 # chart instead mints `gitlab-wildcard-tls` (and `-ca`) via
 # cfssl-self-sign. The Gateway listener needs to match.
+#
+# --- NodePort data-plane exposure ---
+# Chart 10.x's gatewayApiResources.envoy.proxySpec default sets
+# the data-plane Service type to LoadBalancer, expecting a
+# provisioner (MetalLB, cloud-provider-kind, …) to allocate IPs.
+# kind has no such provisioner, so the data-plane Service never
+# becomes ready, the Gateway condition reports `AddressNotUsable`,
+# and listeners stay Accepted=False.
+#
+# Switch the data-plane Service to NodePort and pin nodePort
+# values to match the kind extraPortMappings in
+# infra/tofu/cluster.tf:
+#   host:80    → kind cp container:30080 → data-plane svc port 80
+#   host:443   → kind cp container:30443 → data-plane svc port 443
+#   host:22    → kind cp container:30022 → data-plane svc port 22
+#
+# Pinning nodePort via listener spec is what causes the data-plane
+# Service's port:80/443/22 mapping to expose fixed NodePort values
+# the kind extraPortMappings can target. Without `nodePort:` on the
+# listeners, the chart would pick random NodePorts in the cluster's
+# NodePort range (30000-32767) and the kind port-forward would miss.
 gatewayApiResources:
+  envoy:
+    proxySpec:
+      provider:
+        type: Kubernetes
+        kubernetes:
+          envoyService:
+            type: NodePort
   gateway:
     listeners:
       gitlab-web:
         tls:
           certificateRefs:
             - name: gitlab-wildcard-tls
+        # 443 + NodePort 30443 → matches cluster.tf host:443 mapping.
+        port: 443
+        nodePort: 30443
+      gitlab-web-geo:
+        port: 443
+        nodePort: 30443
+      gitlab-smartcard-web:
+        port: 443
+        nodePort: 30443
+      kas-web:
+        port: 443
+        nodePort: 30443
+      kas-workspaces-web:
+        port: 443
+        nodePort: 30443
+      registry-web:
+        port: 443
+        nodePort: 30443
+      pages-web:
+        port: 443
+        nodePort: 30443
+      openbao-web:
+        port: 443
+        nodePort: 30443
+      http-default:
+        port: 80
+        nodePort: 30080
+      gitlab-ssh:
+        port: 22
+        nodePort: 30022
 
 # The chart-bundled GitLab Runner sub-chart registers against the
 # GitLab instance via `gitlab-runner register`, which uses the

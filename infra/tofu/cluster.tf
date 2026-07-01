@@ -42,15 +42,25 @@ resource "kind_cluster" "cicd" {
           for l in node.value.labels : split("=", l)[0] => split("=", l)[1]
         }
 
-        # Only the control-plane reserves host ports 80/443 so the
+        # Only the control-plane reserves host ports 80/443/22 so the
         # chart-managed Envoy Gateway can serve the *.local.<domain>
         # wildcard on the same address that /etc/hosts binds it to. Putting
         # the mapping on every node would make docker reject the second
         # container that tries to claim 127.0.0.1:80.
+        #
+        # Why containerPort is in the 30000 range (kind's NodePort band):
+        # chart 10.x's bundled envoy-gateway sub-chart defaults the
+        # gateway-api Service to ClusterIP (no external address), which
+        # leaves Gateway.spec.addresses=127.0.0.1 in `AddressNotUsable`
+        # state. We override the Service to NodePort via
+        # helm-values-gitlab.yaml (global.gatewayApi.service.type=NodePort
+        # + matching `nodePorts: {http: 30080, https: 30443, ssh: 30022}`),
+        # and pair that with these host-port mappings so the host's
+        # port 80 → control-plane NodePort 30080 → envoy data-plane.
         dynamic "extra_port_mappings" {
           for_each = node.value.role_kind == "control-plane" ? [1] : []
           content {
-            container_port = 80
+            container_port = 30080
             host_port      = 80
             protocol       = "TCP"
             listen_address = "127.0.0.1"
@@ -59,8 +69,19 @@ resource "kind_cluster" "cicd" {
         dynamic "extra_port_mappings" {
           for_each = node.value.role_kind == "control-plane" ? [1] : []
           content {
-            container_port = 443
+            container_port = 30443
             host_port      = 443
+            protocol       = "TCP"
+            listen_address = "127.0.0.1"
+          }
+        }
+        # gitlab-shell SSH listener (also goes through the chart's
+        # Envoy Gateway + ssh-listener, hence the NodePort mapping).
+        dynamic "extra_port_mappings" {
+          for_each = node.value.role_kind == "control-plane" ? [1] : []
+          content {
+            container_port = 30022
+            host_port      = 22
             protocol       = "TCP"
             listen_address = "127.0.0.1"
           }

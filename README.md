@@ -179,6 +179,26 @@ outside the cluster):
    uv run blueprint-secrets ui                                  # OpenBao UI
    ```
 
+4. **Reach in-cluster services without remembering the
+   `kubectl port-forward` incantation.** The same CLI grew a
+   generic dispatcher — picks the right kubeconfig, namespace,
+   service, and port for you, prints what to do next, and tears
+   down the forward on Ctrl-C:
+
+   ```sh
+   uv run blueprint-secrets port-forward --list                # show menu
+   uv run blueprint-secrets port-forward openbao               # http://127.0.0.1:8200/ui
+   uv run blueprint-secrets port-forward gitlab-registry       # docker login 127.0.0.1:5000
+   uv run blueprint-secrets port-forward minio                 # S3 API + console hints
+   uv run blueprint-secrets port-forward gitlab-webservice     # curl http://127.0.0.1:8181/-/health
+   ```
+
+   The cluster's intended user-facing path is the Gateway/NodePort
+   pair (browser → `https://gitlab.<domain>`) — see step 2 above.
+   `port-forward` is the cluster-side workhorse for things the
+   Gateway doesn't (yet) expose (e.g. Container Registry's plain
+   HTTP v2 endpoint on `127.0.0.1:5000`).
+
 Full details for each phase are in
 [docs/phase-1.md](docs/phase-1.md) and [docs/phase-2.md](docs/phase-2.md).
 At that point you have a working cluster, GitLab, Runner, and
@@ -305,7 +325,7 @@ After `uv sync`, two console scripts land on the per-checkout
 | Script | Wraps | Purpose |
 | --- | --- | --- |
 | `blueprint-bootstrap` | `bootstrap.cli:main` | The installer (`--phase 1 \| 2`, `--check`, `--dry-run`, `--user`). |
-| `blueprint-secrets`  | `bootstrap.secrets_cli:main` | Post-install helper: `read <path> <key>` and `ui` (auto-port-forwards 127.0.0.1:8200). |
+| `blueprint-secrets`  | `bootstrap.secrets_cli:main` | Post-install helper: `read <path> <key>`, `ui` (OpenBao), and `port-forward <service>` (any in-cluster Service — auto-locates the tofu kubeconfig + namespace + port). |
 
 `BootstrapApp` (in `app.py`) is the composition root: it instantiates
 each *installer* — a single-responsibility class that takes only

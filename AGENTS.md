@@ -354,6 +354,40 @@ violate any of them, stop and ask.
   `appConfig.object_store.*.connection.secret` at them. The
   upgrade path is the same — bump the chart version, point at the
   same external services.
+- **Kind + chart 10.x: data-plane exposure is NodePort, not
+  LoadBalancer.** Chart 10.x's bundled envoy-gateway sub-chart
+  defaults the **data-plane** Service to `LoadBalancer`; kind has
+  no provisioner, so the Service never settles and the Gateway
+  reports `AddressNotUsable`. The fix lives in two places:
+
+    1. `infra/tofu/cluster.tf` `extraPortMappings` — host
+       `80`/`443`/`22` map to control-plane NodePort ports
+       `30080`/`30443`/`30022` (via `host_port ↔ container_port`).
+       Don't change the host ports — README post-install steps
+       and `/etc/hosts` entries assume the unprivileged ones.
+    2. `infra/scripts/bootstrap/phase2/references/helm-values-gitlab.yaml`
+       — `gatewayApiResources.envoy.proxySpec.provider.kubernetes.envoyService.type:
+       NodePort` plus each listener's `nodePort: <30080|30443|30022>`.
+       The `nodePort:` values *must* match the kind
+       `extraPortMappings` `container_port` values; without them
+       the chart picks random NodePorts and the host forward
+       misses.
+
+  Don't switch back to LoadBalancer reasoning "MetalLB would
+  scale to multi-node kind"; the rest of the cluster wouldn't
+  route Envoy traffic any differently on a single-host kind
+  loopback, and MetalLB adds a new control-plane to debug.
+  See `docs/phase-2.md § NodePort data-plane exposure` for the
+  full reasoning.
+- **Reach in-cluster services via `blueprint-secrets
+  port-forward`, never hand-rolled `kubectl port-forward`.**
+  The CLI registers (namespace, Service, port) tuples in
+  `bootstrap/secrets_cli.py:PortForwardTarget`, picks the tofu
+  kubeconfig automatically, prints next-step hints, and tears
+  down the forward on Ctrl-C. Don't reintroduce system-level
+  port-forward scripts — they diverge from the cluster's actual
+  Service ports on every chart upgrade. `--list` shows the
+  current menu.
 
 ---
 

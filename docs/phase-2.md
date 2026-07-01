@@ -676,7 +676,99 @@ sub-chart with:
   in `AGENTS.md § Other rules`. The current value is the result
   of a multi-attempt debug session, not a guess.
 
-## 14. Trade-offs (why it's shaped this way)
+## 14. NodePort data-plane exposure (kind + chart 10.x)
+
+Chart 10.x's bundled envoy-gateway sub-chart defaults the
+**data-plane** Service to `type: LoadBalancer`, expecting a
+load-balancer provisioner (MetalLB, cloud-provider-kind, …) to
+allocate an external IP for each Gateway. kind has no such
+provisioner — the data-plane Service never gets a `status.loadBalancer`
+entry, the Gateway condition reports `AddressNotUsable`, and
+listener program-failure cascades into `PROGRAMMED=False`. The
+control-plane Service (named `envoy-gateway`) is still ClusterIP
+and reaches its own pods fine; it's the data-plane Service
+(visible after the first Gateway is reconciled, named like
+`envoy-gitlab-gitlab-gw-<id>`) that's wedged.
+
+We rewire the data-plane to NodePort and pin each listener's
+`nodePort` so kind's `extraPortMappings` can target fixed ports
+in its control-plane container:
+
+  - **kind side** —
+    [`infra/tofu/cluster.tf`](../infra/tofu/cluster.tf)
+    configures the kind control-plane's `extraPortMappings` to
+    bind the host's loopback interface to three fixed NodePort
+    ranges — host `80` → control-plane container `30080`,
+    host `443` → container `30443`, host `22` → container
+    `30022`. (These are mapped **to** the NodePort values
+    Envoy assigns, **not** to the listener-port values — see
+    below.) Trailing comments explain why the swap.
+
+  - **chart side** —
+    [`infra/scripts/bootstrap/phase2/references/helm-values-gitlab.yaml`](../infra/scripts/bootstrap/phase2/references/helm-values-gitlab.yaml)
+    overrides
+    `gatewayApiResources.envoy.proxySpec.provider.kubernetes.envoyService.type`
+    to `NodePort` and pins each listener's `nodePort` to the
+    same 30080/30443/30022 values. The EnvoyProxy CR — which
+    the chart renders from this spec, in
+    `gitlab/templates/envoy/proxy.yaml` — is what tells
+    Envoy Gateway to publish the data-plane Service as
+    NodePort with those specific port mappings.
+
+The Gateway's listeners have `port: 80` / `port: 443` /
+`port: 22` (service-port numbers); the `nodePort:` field is
+separate and only meaningful when the data-plane Service type
+is `NodePort`. Without explicit `nodePort:` values, the chart
+would pick random ports in the 30000–32767 range and the
+`extraPortMappings` pair-up wouldn't match — the kind host
+forward would target ports nothing listens on.
+
+The trade-off vs MetalLB / cloud-provider-kind:
+
+  - **MetalLB** (BGP / L2 mode) gives each LoadBalancer
+    Service a routable IP. Heavier: a separate DaemonSet, a
+    config block in the chart, and a new operator to debug
+    when something breaks. We don't need it.
+  - **cloud-provider-kind** injects `<NodeIP>:NodePort`-style
+    endpoints directly into LoadBalancer Services. Cleaner
+    UX (one less chart override) but **newer and less
+    battle-tested** than NodePort, and the
+    `extraPortMappings` paths still have to exist for SSH /
+    KAS / container-registry ports that aren't LoadBalancer
+    Services in the first place.
+  - **kind `extraPortMappings` + chart `NodePort`** is the
+    pattern the kind upstream recommends for any chart that
+    builds on Gateway API. Two-line change per side; no new
+    control-plane components.
+
+### Reaching the GitLab hostnames
+
+Once the data-plane is reachable on host:443, the README
+post-install flow works unchanged: `/etc/hosts` points
+`gitlab.local.bruj0.net` at `127.0.0.1`, browser hits
+`https://gitlab.local.bruj0.net`, traffic lands on the kind
+control-plane at 30443, kind kube-proxy forwards to the
+data-plane pod on service-port 443, Envoy routes by SNI to
+`gitlab-web`.
+
+For in-cluster/CLI tasks that don't go through the Gateway
+(the Container Registry API on `127.0.0.1:5000`, the MinIO
+S3 endpoint on `127.0.0.1:9000`, the GitLab workhorse HTTP
+on `127.0.0.1:8181`, etc.), use the new CLI dispatcher:
+
+  ```sh
+  uv run blueprint-secrets port-forward --list           # all targets
+  uv run blueprint-secrets port-forward gitlab-registry  # 127.0.0.1:5000
+  ```
+
+It picks the tofu-written kubeconfig, the right namespace,
+the right Service + cluster-port, and tears the forward down
+on Ctrl-C. See `bootstrap/secrets_cli.py` for the registry
+and `AGENTS.md § Hard rules` for the rule "don't reintroduce
+system-level `kubectl port-forward` scripts" — the CLI is
+the supported way.
+
+## 15. Trade-offs (why it's shaped this way)
 
 - **Chart-managed TLS instead of cert-manager.** Public
   Let's Encrypt cannot validate `*.local.bruj0.net` (the host
