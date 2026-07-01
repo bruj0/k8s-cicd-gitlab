@@ -33,8 +33,14 @@ from ..shell import CommandRunner, DryRunRunner
 
 MINIO_NAMESPACE = "minio"
 MINIO_RELEASE = "minio"
-MINIO_ROOT_USER_SECRET = "minio-root-user"
-MINIO_ROOT_PASSWORD_SECRET = "minio-root-password"
+# MinIO chart 5.x collapses root credentials into a single Secret
+# named after the fullname (= MINIO_RELEASE = "minio") with two
+# keys `rootUser` and `rootPassword`. Older chart versions
+# split these into separate `minio-root-user` + `minio-root-password`
+# Secrets; that naming no longer applies.
+MINIO_ROOT_SECRET = "minio"
+MINIO_ROOT_USER_KEY = "rootUser"
+MINIO_ROOT_PASSWORD_KEY = "rootPassword"
 MINIO_API_SERVICE = "minio"
 MINIO_API_PORT = 9000
 MINIO_CONSOLE_PORT = 9001
@@ -104,6 +110,15 @@ class MinIOInstaller:
         The minio chart v5.4.0 image ships `mc` in the main container,
         so we exec a single shell that aliases the local MinIO and
         creates all buckets idempotently.
+
+        Note on credentials: minio chart 5.x reads root credentials
+        from files (env vars `MINIO_ROOT_USER_FILE` /
+        `MINIO_ROOT_PASSWORD_FILE` point at /tmp/access_key +
+        /tmp/secret_key mounted from Secret `minio`). Earlier chart
+        versions used plain env vars `MINIO_ROOT_USER` /
+        `MINIO_ROOT_PASSWORD` directly. We read the files and
+        interpolate the values into the `mc alias set` call so it
+        works against either chart version.
         """
         if isinstance(self.runner, DryRunRunner):
             return
@@ -111,11 +126,16 @@ class MinIOInstaller:
             f"http://{MINIO_API_SERVICE}.{MINIO_NAMESPACE}.svc.cluster.local"
             f":{MINIO_API_PORT}"
         )
-        # `mc alias set` uses MINIO_ROOT_USER / MINIO_ROOT_PASSWORD from
-        # the chart-injected env. The bucket loop uses --ignore-existing
-        # so re-running bootstrap is safe.
+        # `mc alias set` takes user + password as positional args.
+        # We read the chart-injected files at runtime (the files
+        # are mounted into the minio pod, not into ours). Use shell
+        # parameter expansion so the secret material never appears
+        # in process listings / log streams.
         script = (
-            f"mc alias set local {alias} \"$MINIO_ROOT_USER\" \"$MINIO_ROOT_PASSWORD\""
+            "set -e; "
+            "USER_VAL=\"$(cat \"${MINIO_ROOT_USER_FILE:-/tmp/access_key}\")\"; "
+            "PASS_VAL=\"$(cat \"${MINIO_ROOT_PASSWORD_FILE:-/tmp/secret_key}\")\"; "
+            f"mc alias set local {alias} \"$USER_VAL\" \"$PASS_VAL\""
             + "".join(
                 f" && mc mb --ignore-existing local/{b}" for b in GITLAB_BUCKETS
             )
@@ -146,13 +166,13 @@ class MinIOInstaller:
         if isinstance(self.runner, DryRunRunner):
             return
         user_out = self.runner.run(
-            ["kubectl", "-n", MINIO_NAMESPACE, "get", "secret", MINIO_ROOT_USER_SECRET,
-             "-o", "jsonpath={.data.rootUser}"],
+            ["kubectl", "-n", MINIO_NAMESPACE, "get", "secret", MINIO_ROOT_SECRET,
+             "-o", f"jsonpath={{.data.{MINIO_ROOT_USER_KEY}}}"],
             check=True,
         )
         pass_out = self.runner.run(
-            ["kubectl", "-n", MINIO_NAMESPACE, "get", "secret", MINIO_ROOT_PASSWORD_SECRET,
-             "-o", "jsonpath={.data.rootPassword}"],
+            ["kubectl", "-n", MINIO_NAMESPACE, "get", "secret", MINIO_ROOT_SECRET,
+             "-o", f"jsonpath={{.data.{MINIO_ROOT_PASSWORD_KEY}}}"],
             check=True,
         )
         user = base64.b64decode(user_out.stdout.strip()).decode()

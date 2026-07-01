@@ -33,7 +33,11 @@ from ..shell import CommandRunner, DryRunRunner
 REDIS_NAMESPACE = "redis"
 REDIS_RELEASE = "redis"
 REDIS_MASTER_SERVICE = "redis-master"
-REDIS_PASSWORD_SECRET = "redis-password"
+# Bitnami/redis chart 20.x: the master credentials live in a
+# Secret named after the fullname (= REDIS_RELEASE = "redis") with
+# a single key `redis-password`. Older chart versions used a
+# separate `redis-password` Secret; that naming no longer applies.
+REDIS_PASSWORD_SECRET = "redis"
 REDIS_PASSWORD_FILE = "redis-password.txt"
 
 
@@ -74,13 +78,21 @@ class RedisInstaller:
         self.log.ok("Redis master pod is Ready")
 
     def snapshot_password(self) -> None:
-        """Copy the auto-generated password Secret to infra/secrets/.
+        """Persist Redis password to host + mirror Secret into `gitlab`
+        namespace for the GitLab chart to consume.
 
-        GitLab chart values reference this password via
-        `global.redis.auth.existingSecret: redis-password` (set in
-        phase2/references/helm-values-gitlab.yaml). We mirror the
-        Secret into infra/secrets/ so the bootstrap's `--destroy`
-        command can wipe host-side state cleanly.
+        The GitLab chart references the password via
+        `global.redis.auth.secret: redis-password` + `key:
+        redis-password` (set in
+        phase2/references/helm-values-gitlab.yaml). That Secret
+        must live in the **gitlab** namespace, but the
+        bitnami/redis chart mints it in the **redis** namespace.
+        We mirror it here so the chart init-containers can mount
+        it.
+
+        We also write the password to infra/secrets/ so the
+        bootstrap's `--destroy` command can wipe host-side state
+        cleanly.
         """
         if isinstance(self.runner, DryRunRunner):
             return
@@ -91,6 +103,7 @@ class RedisInstaller:
         )
         import base64
         password = base64.b64decode(out.stdout.strip()).decode()
+        # 1. Persist to host-side file
         self.paths.ensure_secrets_dir()
         path = self.paths.secrets_dir / REDIS_PASSWORD_FILE
         path.write_text(password + "\n")
@@ -99,6 +112,33 @@ class RedisInstaller:
         except OSError:
             pass
         self.log.ok(f"Persisted Redis password to {path.name} (mode 0600)")
+
+        # 2. Mirror into the gitlab namespace so the chart init
+        # containers can mount Secret `redis-password`. The chart
+        # does not bootstrap this for us (it expects the operator
+        # to pre-create the Secret when the redis chart lives in
+        # a separate namespace). Idempotent: delete-then-create
+        # avoids patching the Secret type over time.
+        self.runner.run(
+            ["kubectl", "create", "namespace", "gitlab"],
+            check=False,
+        )
+        self.runner.run(
+            ["kubectl", "-n", "gitlab", "delete", "secret",
+             "redis-password", "--ignore-not-found"],
+            check=True,
+        )
+        self.runner.run(
+            ["kubectl", "-n", "gitlab", "create", "secret", "generic",
+             "redis-password",
+             f"--from-literal=redis-password={password}",
+             "--save-config"],
+            check=True,
+        )
+        self.log.ok(
+            f"Mirrored Secret `redis-password` into namespace `gitlab` "
+            f"(chart init-containers can now mount it)"
+        )
 
 
 def build_redis_installer(runner: CommandRunner, paths: Paths, cache, log: Logger) -> HelmAppInstaller:

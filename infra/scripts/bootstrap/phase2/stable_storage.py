@@ -81,6 +81,8 @@ Run order:
 
 from __future__ import annotations
 
+import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -144,6 +146,28 @@ class StableVolume:
     # annotation is safe — the operator then patches both to its
     # canonical values, overriding ours.
     pvc_labels: dict[str, str] = field(default_factory=dict)
+    # CNPG-specific: the pod's runAsUser/runAsGroup. When set, the
+    # bootstrap chowns the host dir to this UID:GID via
+    # `docker exec <worker>` (the user is in the docker group, so
+    # this works without sudo), AND creates a `pgdata/` subdir
+    # inside `host_dir` so CNPG's hardcoded
+    # `PGDATA=/var/lib/postgresql/data/pgdata` resolves to a path
+    # the pod can chmod 0700.
+    #
+    # Why this matters: CNPG's `EnsurePgDataPerms` (see
+    # cloudnative-pg/pkg/fileutils/fileutils.go + call site in
+    # pkg/management/postgres/instance.go) does an unconditional
+    # `chmod 0700` on PGDATA, which requires ownership. If the
+    # host dir is owned by the bootstrap user (e.g. bruj0:1000),
+    # the pod (runAsUser=26 for postgres) can't chmod it and the
+    # instance-manager exits in ~1ms. We hit this on the 2026-07-01
+    # fresh install — see git log for the diagnosis.
+    #
+    # Setting `run_as_user = 26` (postgres) makes the bootstrap
+    # chown the host dir to 26:26 via docker exec AND pre-create
+    # `pgdata/` inside it (CNPG's hardcoded PGDATA subdir).
+    run_as_user: int = 0          # 0 = no chown / subdir needed
+    run_as_group: int = 0
 
     @property
     def host_path(self) -> str:
@@ -235,6 +259,13 @@ STABLE_VOLUMES: tuple[StableVolume, ...] = (
             "cnpg.io/instanceName": "postgresql-cnpg-1",
             "cnpg.io/instanceRole": "primary",
         },
+        # CNPG postgres container runs as uid=26 gid=26 (see
+        # spec.postgresUID/postgresGID in cluster-postgresql.yaml
+        # which CNPG defaults to). The bootstrap chowns the host
+        # dir to 26:26 via docker exec AND creates the `pgdata/`
+        # subdir CNPG's hardcoded PGDATA path expects.
+        run_as_user=26,
+        run_as_group=26,
     ),
     # External Redis data — chart 10.x consumes Redis externally
     # via `global.redis.host`. The bitnami/redis chart creates a
@@ -333,9 +364,91 @@ class StableStorageInstaller:
             # no-op on hostPath (the dir lives outside the
             # container's filesystem), so the host-side mode has
             # to already permit world-write.
+            #
+            # On re-install the dir may already be owned by the
+            # chart's UID (we chown to 26:26 for CNPG below) — in
+            # that case chmod fails with EPERM for the bootstrap
+            # user. mkdir(parents=True, exist_ok=True) still works
+            # (no chmod). Swallow the chmod EPERM specifically; any
+            # other error re-raises.
             host_dir.mkdir(parents=True, exist_ok=True)
-            host_dir.chmod(0o777)
+            try:
+                host_dir.chmod(0o777)
+            except PermissionError:
+                self._log.info(
+                    f"Stable host dir {host_dir} owned by another UID "
+                    f"(likely from a previous CNPG chown to "
+                    f"{vol.run_as_user}:{vol.run_as_group}) — skipping "
+                    f"chmod, mode is whatever the previous install left"
+                )
             self._log.info(f"Stable host dir: {host_dir} (mode 0777)")
+
+            # CNPG-specific: chown to the pod's UID:GID + pre-create
+            # the `pgdata/` subdir that CNPG's hardcoded
+            # `PGDATA=/var/lib/postgresql/data/pgdata` references.
+            # Without this, the postgres container's
+            # `EnsurePgDataPerms → chmod 0700 PGDATA` fails with
+            # "operation not permitted" (the bootstrap user owns
+            # the host dir, not postgres UID 26).
+            #
+            # We use `docker exec <worker>` because (a) the bootstrap
+            # user is in the docker group so no sudo needed, and
+            # (b) the kind worker has the bind-mount live at
+            # /var/local/shared, so chown propagates via the
+            # shared mount back to the host (Bidirectional
+            # propagation under the default destructive contract,
+            # see infra/tofu/cluster.tf).
+            if vol.run_as_user and vol.run_as_group:
+                pgdata_subdir = host_dir / "pgdata"
+                pgdata_subdir.mkdir(parents=True, exist_ok=True)
+                # Same EPERM-tolerance as host_dir above: after the
+                # first install the dir is owned by UID 26, so the
+                # bootstrap user can't chmod. The pod will chmod 0700
+                # itself when it starts.
+                try:
+                    pgdata_subdir.chmod(0o755)
+                except PermissionError:
+                    self._log.info(
+                        f"CNPG pgdata subdir {pgdata_subdir} owned by "
+                        f"another UID — skipping chmod"
+                    )
+                self._log.info(
+                    f"CNPG pgdata subdir: {pgdata_subdir} (ready for "
+                    f"chmod 0700 by pod)"
+                )
+                # Find which worker node the PVC would land on by
+                # inspecting the PV (we haven't applied it yet, so
+                # fall back to all workers). The bind mount is on
+                # every worker, so chowning all of them is safe
+                # (it's a no-op on the ones the pod doesn't land on).
+                chown_targets = []
+                for worker in self._detect_kind_workers():
+                    chown_targets.append(worker)
+                if not chown_targets:
+                    self._log.warn(
+                        f"No kind workers detected for chown of {host_dir} "
+                        f"— pod may fail to start with 'operation not permitted' "
+                        f"on chmod"
+                    )
+                for worker in chown_targets:
+                    cmd = [
+                        "docker", "exec", worker,
+                        "chown", "-R",
+                        f"{vol.run_as_user}:{vol.run_as_group}",
+                        vol.host_path,
+                    ]
+                    try:
+                        self._r.run(cmd, check=True, log=False)
+                        self._log.info(
+                            f"chown {vol.host_path} -> "
+                            f"{vol.run_as_user}:{vol.run_as_group} "
+                            f"on {worker}"
+                        )
+                    except Exception as e:
+                        self._log.warn(
+                            f"chown on {worker} failed: {e} — pod may "
+                            f"fail to start"
+                        )
 
             if vol.flavor == "existing_claim":
                 pv_yaml = self._pv_existing_claim_yaml(vol)
@@ -368,6 +481,23 @@ class StableStorageInstaller:
                 f"{vol.namespace}/{vol.pvc_name} → {host_dir} "
                 f"(chart: {vol.chart_value_path}={vol.chart_value!r})"
             )
+
+    def _detect_kind_workers(self) -> list[str]:
+        """Return the list of kind worker container names (without
+        cluster introspection — kind's docker container naming
+        convention is `<cluster-name>-worker[N]` and the cluster
+        name comes from `tofu output cluster_name`).
+        """
+        cluster = os.environ.get("BLUEPRINT_CLUSTER_NAME", "cicd")
+        try:
+            out = subprocess.run(
+                ["docker", "ps", "--filter", f"name={cluster}-worker",
+                 "--format", "{{.Names}}"],
+                capture_output=True, text=True, check=True,
+            )
+            return [n.strip() for n in out.stdout.splitlines() if n.strip()]
+        except Exception:
+            return []
 
     # ---------- manifest helpers ----------
 
