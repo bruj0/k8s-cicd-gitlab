@@ -9,10 +9,18 @@
 # What we override:
 #
 #   - global.hosts.domain / externalIP — the chart uses these to
-#      assemble `gitlab.<domain>` URLs and to bind the Gateway's
-#      loadBalancer-style address. We use local.bruj0.net for dev;
-#      the user updates DNS (or /etc/hosts) to the cluster IP
+#      assemble `gitlab.<domain>` URLs. We use local.bruj0.net for
+#      dev; the user updates DNS (or /etc/hosts) to the cluster IP
 #      manually — see Phase 2's end-of-run handoff.
+#
+#      NOTE: `externalIP` is intentionally NOT empty. The chart's
+#      `templates/gateway.yaml` uses it as the Gateway `spec.addresses`
+#      source when `gatewayApiResources.gateway.addresses` is unset.
+#      We block that path by setting `addresses: []` on the gateway
+#      block below, so the operator's data-plane Service is created
+#      without a `127.0.0.1` externalIP (which Kubernetes rejects as
+#      loopback). externalIP is still needed for non-Gateway URL
+#      assembly in NOTES.txt and a few sub-chart templates.
 #
 #   - global.ingress.enabled: false — we route via Gateway API.
 #
@@ -242,11 +250,24 @@ registry:
 #   host:443   → kind cp container:30443 → data-plane svc port 443
 #   host:22    → kind cp container:30022 → data-plane svc port 22
 #
-# Pinning nodePort via listener spec is what causes the data-plane
-# Service's port:80/443/22 mapping to expose fixed NodePort values
-# the kind extraPortMappings can target. Without `nodePort:` on the
-# listeners, the chart would pick random NodePorts in the cluster's
-# NodePort range (30000-32767) and the kind port-forward would miss.
+# Pinning nodePort via the listener spec does NOT actually pin the
+# data-plane Service's NodePort — the Gateway API spec has no
+# `nodePort` field on listeners, and the EnvoyProxy CR
+# (`gateway.envoyproxy.io/v1alpha1`) has no per-port nodePort field
+# either. The operator always picks random NodePorts in the cluster's
+# 30000-32767 range. We keep the `nodePort: 30443` etc. annotations
+# in each listener for documentation only, and the bootstrap's
+# `GitlabInstaller._patch_gateway_data_plane` re-pins the
+# data-plane Service's NodePorts via `kubectl patch` after install.
+#
+# Also: `gatewayApiResources.gateway.addresses` is explicitly set to
+# an empty list. The chart's `templates/gateway.yaml` would otherwise
+# copy `global.hosts.externalIP` (= 127.0.0.1 in dev) into
+# `spec.addresses`, and the Envoy Gateway operator then tries to
+# create the data-plane Service with `externalIPs: [127.0.0.1]`,
+# which Kubernetes rejects ("may not be in the loopback range
+# 127.0.0.0/8"). Empty list = no Gateway addresses = no externalIPs
+# on the operator-managed Service.
 gatewayApiResources:
   envoy:
     proxySpec:
@@ -255,6 +276,10 @@ gatewayApiResources:
         kubernetes:
           envoyService:
             type: NodePort
+  gateway:
+    # Empty list: prevents the chart from copying global.hosts.externalIP
+    # into the Gateway's `spec.addresses`. See header comment above.
+    addresses: []
   gateway:
     listeners:
       gitlab-web:

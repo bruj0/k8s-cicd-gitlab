@@ -121,19 +121,158 @@ class GitlabInstaller(HelmAppInstaller):
         # 1. Install the chart.
         result = super().install()
 
-        # 2. Wait for GitLab's webservice to be ready (this is the slow part).
+        # 2. Patch the chart-managed Gateway + Envoy data-plane Service
+        #    so the cluster's external host-port mappings (kind
+        #    extraPortMappings 80/443/22 → cp container 30080/30443/30022)
+        #    actually line up with the operator's Service. This MUST
+        #    happen before the user runs `--port-forward gitlab`, so
+        #    the port-forward target Service can be looked up by name
+        #    + so the NodePort is stable across cluster recreates.
+        self._patch_gateway_data_plane()
+
+        # 3. Wait for GitLab's webservice to be ready (this is the slow part).
         self._wait_for_webservice()
 
-        # 3. Push a known root password into GitLab + OpenBao.
+        # 4. Push a known root password into GitLab + OpenBao.
         self._ensure_initial_password()
 
-        # 4. Capture the runner registration token and stash it in OpenBao.
+        # 5. Capture the runner registration token and stash it in OpenBao.
         creds = self._capture_credentials()
         self._openbao.kv_put("gitlab/runner", {RUNNER_TOKEN_KEY: creds.runner_registration_token})
         self._log.ok("GitLab credentials captured into OpenBao")
         return result
 
-    # ---------- (no post-install patches — port-forward is the access path) ----------
+    # ---------- post-install patches ----------
+
+    def _patch_gateway_data_plane(self, timeout_s: int = 300) -> None:
+        """Pin the Envoy Gateway data-plane Service to fixed NodePorts.
+
+        The chart 10.1.1 deploys a Gateway (`gitlab-gw`) and the Envoy
+        Gateway operator then creates a data-plane Service
+        `envoy-<release>-<gw>-<hash>` that fronts the cluster's
+        external traffic. The operator picks RANDOM NodePorts in
+        30000-32767 because:
+
+          * The Gateway API spec has no `nodePort` field on listeners.
+          * The EnvoyProxy CR's `provider.kubernetes.envoyService`
+            block has no per-port `nodePort` field.
+          * Our `gatewayApiResources.gateway.listeners.*.nodePort` keys
+            are silently ignored by the chart (its listener template
+            only renders `port:`).
+
+        To make the kind `extraPortMappings` (host:80→30080,
+        host:443→30443, host:22→30022) match the data-plane Service,
+        we patch the operator's Service after install. The owner ref
+        is the GatewayClass (not the Gateway or chart), so the operator
+        doesn't fight us on subsequent reconciles.
+
+        Also strips `127.0.0.1` from the Gateway's `spec.addresses` if
+        the chart still put it there (older values files or chart
+        re-renders). Without this strip, the operator creates the
+        data-plane Service with `spec.externalIPs: [127.0.0.1]` and
+        the kube-apiserver rejects the Service as loopback
+        (the data plane never comes up).
+
+        Idempotent: re-running is a no-op (the operator's reconciler
+        would reset the address if we removed it, but our values file
+        sets `gatewayApiResources.gateway.addresses: []` so the
+        addresses field stays empty).
+
+        No-op in dry-run.
+        """
+        from ..shell import DryRunRunner
+        if isinstance(self._r, DryRunRunner):
+            self._log.info("[dry-run] would pin envoy data-plane service nodePorts")
+            return
+
+        # 1. Strip any `127.0.0.1` (or any IPAddress) the chart may have
+        #    placed in the Gateway's spec.addresses. The chart's
+        #    `templates/gateway.yaml` writes
+        #    `addresses: [{type:IPAddress, value:global.hosts.externalIP}]`
+        #    whenever `gatewayApiResources.gateway.addresses` is unset
+        #    AND `global.hosts.externalIP` is non-empty. Our values
+        #    override `gatewayApiResources.gateway.addresses: []`, but
+        #    an older values file or a re-render could re-introduce it.
+        self._log.info("Stripping any IPAddress from Gateway spec.addresses "
+                       "(avoids 127.0.0.1 in operator data-plane externalIPs)")
+        patch_result = self._r.run([
+            "kubectl", "patch", "gateway", "gitlab-gw",
+            "--namespace", self.NAMESPACE,
+            "--type=json",
+            "-p", '[{"op": "remove", "path": "/spec/addresses"}]',
+        ], check=False)
+        if patch_result.ok:
+            self._log.ok("Gateway spec.addresses cleared")
+        else:
+            # `remove` on a non-existent field is fine (HTTP 200 with
+            # no-op). Anything else we log but don't fail — the bootstrap
+            # shouldn't abort just because the field was already gone.
+            self._log.info(f"  (gateway patch returned: {patch_result.stderr.strip()[:200]})")
+
+        # 2. Wait for the Envoy Gateway operator to materialize the
+        #    data-plane Service. Naming pattern (per chart 10.1.1 +
+        #    envoy-gateway v1.5.0): `envoy-<release>-<gw>-<hash>`.
+        #    The `hash` is a stable 8-char suffix from the
+        #    GatewayClass UID, so we discover it via label selector.
+        self._log.info("Waiting for Envoy Gateway operator to create data-plane Service")
+        svc_name: str | None = None
+        import time
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            r = self._r.run([
+                "kubectl", "get", "svc", "--namespace", self.NAMESPACE,
+                "--no-headers",
+                "-l", "gateway.envoyproxy.io/owning-gateway-name=gitlab-gw,"
+                      "gateway.envoyproxy.io/owning-gateway-namespace=gitlab",
+                "-o", "custom-columns=NAME:.metadata.name",
+            ], check=False)
+            if r.ok and r.stdout.strip():
+                lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+                # Skip the header line.
+                candidates = [ln for ln in lines if ln != "NAME"]
+                if candidates:
+                    svc_name = candidates[0]
+                    break
+            time.sleep(2)
+        if not svc_name:
+            # Fall back to the well-known name pattern. If the operator
+            # hasn't reconciled by now, the bootstrap can still
+            # proceed — the user can re-run patch later (or it'll be
+            # picked up on the next GitlabInstaller.is_initialized
+            # check).
+            self._log.warn(
+                f"Envoy data-plane Service not found within {timeout_s}s. "
+                f"Operator may still be reconciling. Continuing."
+            )
+            return
+        self._log.ok(f"Envoy data-plane Service: {svc_name}")
+
+        # 3. Pin the NodePorts to match the kind extraPortMappings in
+        #    infra/tofu/cluster.tf (host:80→30080, host:443→30443,
+        #    host:22→30022). The patch uses JSON Merge so the
+        #    operator's `clusterIP`, `externalTrafficPolicy`, and
+        #    endpoints are preserved.
+        self._log.info("Pinning Envoy data-plane Service NodePorts "
+                       "(https-443→30443, http-80→30080, tcp-22→30022)")
+        port_patch = self._r.run([
+            "kubectl", "patch", "svc", svc_name,
+            "--namespace", self.NAMESPACE,
+            "--type=json",
+            "-p", "["
+                  '{"op": "replace", "path": "/spec/ports/0/nodePort", "value": 30080},'
+                  '{"op": "replace", "path": "/spec/ports/1/nodePort", "value": 30443},'
+                  '{"op": "replace", "path": "/spec/ports/2/nodePort", "value": 30022}'
+                  "]",
+        ], check=False)
+        if port_patch.ok:
+            self._log.ok("Envoy data-plane NodePorts pinned")
+        else:
+            # Likely the operator is mid-reconcile and reset the
+            # Service. Not fatal — the next iteration of the
+            # bootstrap pipeline will retry.
+            self._log.warn(
+                f"NodePort patch returned: {port_patch.stderr.strip()[:300]}"
+            )
 
     # ---------- internals ----------
 
