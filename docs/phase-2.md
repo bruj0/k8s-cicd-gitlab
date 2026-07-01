@@ -45,14 +45,34 @@ self-signed wildcard. Trust the CA on the host first (see
 | `https://minio.local.bruj0.net`            | `root` / OpenBao secret                            | MinIO (LFS, artifacts, packages) |
 | `https://openbao.local.bruj0.net`          | root token in `infra/secrets/openbao-init.json`    | OpenBao UI                       |
 
-## 2. The 5-step pipeline
+## 2. The 9-step pipeline
 
 ```
-1. Pre-flight          cluster + helm reachable
-2. Gateway CRDs        upstream standard + 2 chart-shipped Envoy CRDs
-3. OpenBao             install + init + unseal
-4. GitLab              chart + Envoy sub-chart + self-signed cert + token capture
-5. GitLab Runner       install with the token from OpenBao
+ 1. Pre-flight              cluster + helm reachable
+ 2. Gateway CRDs            upstream standard + 2 chart-shipped Envoy CRDs
+ 3. local-path provisioner  rancher/local-path with `local-path` as default
+                            StorageClass + bind pathBase → /var/local/shared
+ 4. Stable PV/PVC pairs     pre-create hostPath-backed PVs for the stateful
+                            services we want to preserve across cluster
+                            recreates (PostgreSQL, Redis, Prometheus, Gitaly,
+                            MinIO, OpenBao) — 3 flavors depending on how the
+                            chart mints its PVC.
+ 5. OpenBao                 install + init + unseal
+ 6. Wildcard TLS certs      mint a self-signed CA + wildcard cert for
+                            *.local.bruj0.net and materialise the 4 Gateway
+                            listener Secrets. Idempotent: re-uses a cert that
+                            has ≥30 days of validity left.
+ 7. Persistent Secrets      restore chart-managed Secrets (postgres/redis/
+                            minio/rails/gitaly/kas) from the host-side
+                            snapshot so the chart sees them already exist
+                            and re-uses the same credentials as the on-disk
+                            data — without this, PG logs
+                            `password authentication failed` after every
+                            cluster recreate.
+ 8. GitLab                  chart + Envoy sub-chart + token capture + write
+                            initial root password to OpenBao
+ 9. GitLab Runner           install with the registration token from OpenBao
+                            (snapshotted into OpenBao by step 8)
 ```
 
 Each step is one method on `Phase2Pipeline` (`_step_*`) and one
@@ -65,10 +85,39 @@ Idempotency is achieved by:
 
   - probing the cluster (`kubectl get`) before doing anything;
   - reading the init JSON / KV state to detect "already done";
+  - reading the cert validity to decide whether to re-mint the
+    wildcard;
+  - reading the host-side Secrets snapshot to decide whether to
+    restore (`gitlab-runtime-secrets.yaml` missing → fresh
+    install, chart will mint new passwords and the snapshot
+    gets re-written at the end of the install);
   - using `helm upgrade --install` (creates or upgrades, never
     errors on existing release);
   - `kubectl apply --server-side --force-conflicts` for the
-    CRDs (re-applying is fine, the server resolves conflicts).
+    CRDs and PVs (re-applying is fine, the server resolves
+    conflicts).
+
+### Wiping everything
+
+The bootstrap ships a one-shot teardown:
+
+```sh
+uv run blueprint-bootstrap --destroy [--yes] [--dry-run]
+```
+
+Runs `tofu destroy` (cluster lifecycle is owned by OpenTofu;
+see `AGENTS.md § 4 rule #3`), then recursively wipes the
+bootstrap-owned host-side state: `infra/data/shared/stable/`,
+`infra/data/shared/*.preserved-*` orphan dirs, `infra/tls/wildcard/`,
+`infra/secrets/openbao-init.json`, `infra/secrets/gitlab-runtime-secrets.yaml`.
+PV dirs that the local-path-provisioner mv'd to `*.preserved-<ts>`
+on past helm uninstalls are also cleaned up. If a stable dir is
+owned by a pod UID that our user can't unlink (openbao=100,
+postgres=1001), `--destroy` falls back to a one-shot
+`docker run --rm` (or `podman run`) bind-mounting the parent
+dir, so the privileged container can `chmod -R a+rwX && rm -rf`
+the child. `--destroy` never recreates — the user must run
+`tofu apply` themselves, per `AGENTS.md § 4 rule #1`.
 
 ## 3. The big idea: the chart owns the rest
 
@@ -105,20 +154,25 @@ has a chart value that turns it on. Read the chart's
 ```
 infra/scripts/bootstrap/
 ├── cli.py                        # click wrapper: `blueprint-bootstrap` entry point
+│                                 # + `--destroy` / `--port-forward` / `--dry-run`
 ├── secrets_cli.py                # click wrapper: `blueprint-secrets` (post-install helper)
 ├── app.py                        # composition root — wires Phase2Installers into BootstrapApp
 ├── app_installer.py              # base class HelmAppInstaller + generic helm plumbing
 ├── phase2/
-│   ├── pipeline.py               # Phase2Pipeline — orchestrates the 5 steps
+│   ├── pipeline.py               # Phase2Pipeline — orchestrates the 9 steps
 │   ├── catalog.py                # Phase2Installers dataclass — bundle of every installer
-│   ├── gateway.py                # GatewayCRDsInstaller
+│   ├── gateway.py                # GatewayCRDsInstaller (upstream + chart-shipped CRDs)
+│   ├── local_path_provisioner.py # local-path StorageClass + teardown patches
+│   ├── stable_storage.py         # pre-create stable PV/PVC pairs
 │   ├── openbao.py                # OpenBaoInstaller (chart + init + unseal)
+│   ├── wildcard_certs.py         # mint CA + wildcard cert + 4 Gateway listener Secrets
+│   ├── persistent_secrets.py     # snapshot + restore chart-managed Secrets
 │   ├── gitlab.py                 # GitlabInstaller (chart + token capture)
 │   ├── runner.py                 # GitLabRunnerInstaller
 │   ├── secrets.py                # OpenBaoClient (hvac + auto port-forward)
 │   └── references/
 │       ├── helm-values-openbao.yaml
-│       ├── helm-values-gitlab.yaml
+│       ├── helm-values-gitlab.yaml   # also pins minio.persistence.volumeName → pv-gitlab-minio
 │       ├── helm-values-runner.yaml
 │       └── gateway-api-crds/    # 3 vendored CRD files
 │                                  #   - gatewayapi-crds.yaml (upstream standard)
@@ -131,14 +185,23 @@ infra/scripts/bootstrap/
 ```
 BootstrapApp (app.py)
   └─> Phase2Pipeline (phase2/pipeline.py)
-        ├─> _step_preflight      → CommandRunner probes
-        ├─> _step_gateway_crds   → GatewayCRDsInstaller
-        ├─> _step_openbao        → OpenBaoInstaller
-        │                            └─> OpenBaoClient (init, unseal, kv mounts)
-        ├─> _step_gitlab         → GitlabInstaller
-        │                            └─> OpenBaoClient (write root password + capture runner token)
-        └─> _step_runner         → GitLabRunnerInstaller
-                                     └─> OpenBaoClient (read runner token)
+        ├─> _step_preflight                     → CommandRunner probes
+        ├─> _step_gateway_crds                  → GatewayCRDsInstaller
+        ├─> _step_local_path                    → LocalPathProvisionerInstaller
+        ├─> _step_stable_storage                → StableStorageInstaller
+        │                                            (3 flavors: existing_claim,
+        │                                             volume_claim_template,
+        │                                             pvc_with_volume_name)
+        ├─> _step_openbao                       → OpenBaoInstaller
+        │                                            └─> OpenBaoClient (init, unseal, kv mounts)
+        ├─> _step_wildcard_certs                → WildcardCertsInstaller
+        ├─> _step_persistent_secrets_restore    → PersistentSecretsInstaller.restore()
+        ├─> _step_gitlab                        → GitlabInstaller
+        │                                            └─> OpenBaoClient (write root password
+        │                                                 + capture runner token)
+        ├─> _step_persistent_secrets_snapshot   → PersistentSecretsInstaller.snapshot()
+        └─> _step_runner                        → GitLabRunnerInstaller
+                                                     └─> OpenBaoClient (read runner token)
 ```
 
 `OpenBaoClient` is **the only stateful helper** Phase 2 shares
@@ -362,16 +425,20 @@ keys.
 ## 9. How to debug a failing step
 
 When `--phase 2` fails, the message looks like
-`Phase 2 install failed at step N/5: <error>`. The mapping
+`Phase 2 install failed at step N/9: <error>`. The mapping
 from step to source file is:
 
 | Step | Source                                                       |
 | ---- | ------------------------------------------------------------ |
-| 1/5  | `phase2/pipeline.py:_step_preflight`                          |
-| 2/5  | `phase2/gateway.py` + `phase2/references/gateway-api-crds/`   |
-| 3/5  | `phase2/openbao.py` + `phase2/secrets.py` (the `OpenBaoClient`) + `phase2/references/helm-values-openbao.yaml` |
-| 4/5  | `phase2/gitlab.py` + `phase2/references/helm-values-gitlab.yaml` |
-| 5/5  | `phase2/runner.py` + `phase2/references/helm-values-runner.yaml` |
+| 1/9  | `phase2/pipeline.py:_step_preflight`                          |
+| 2/9  | `phase2/gateway.py` + `phase2/references/gateway-api-crds/`   |
+| 3/9  | `phase2/local_path_provisioner.py` (StorageClass + bind-mount patches) |
+| 4/9  | `phase2/stable_storage.py` (3 flavors: `existing_claim` / `volume_claim_template` / `pvc_with_volume_name`) |
+| 5/9  | `phase2/openbao.py` + `phase2/secrets.py` (`OpenBaoClient`) + `phase2/references/helm-values-openbao.yaml` |
+| 6/9  | `phase2/wildcard_certs.py` (CA + cert mint + 4 Gateway listener Secrets) |
+| 7/9  | `phase2/persistent_secrets.py:restore()` + `infra/secrets/gitlab-runtime-secrets.yaml` (host-side snapshot) |
+| 8/9  | `phase2/gitlab.py` + `phase2/references/helm-values-gitlab.yaml` |
+| 9/9  | `phase2/runner.py` + `phase2/references/helm-values-runner.yaml` |
 
 In addition:
 
@@ -412,11 +479,57 @@ In addition:
   lazily per process and tears it down on atexit.
 
 - **One phase 2 step per chart, no composite steps.** The
-  pipeline is a flat list of 5 steps today. The temptation to
+  pipeline is a flat list of 9 steps today. The temptation to
   collapse steps (e.g. "install GitLab + Runner + capture
   token" into one mega-step) makes failure diagnosis much
   harder. Keep steps fine-grained: one chart per step, with
   post-install work in the same `install()` method.
+- **Bootstrap-minted wildcard cert, not the chart's cfssl
+  Job.** The chart ships a pre-install `cfssl` Job that mints
+  the wildcard cert and writes it to a Secret the Gateway
+  listeners reference. That Job **only runs when
+  `gitlab.ingress.tls.configured` returns `"false"`** — i.e.
+  when no external ingress is set up. With
+  `global.gatewayApi.enabled=true`, the chart's
+  `gitlab.ingress.tls.configured` getter returns `"true"` and
+  the cfssl Job is skipped, leaving the Gateway listeners
+  pointing at the wrong Secret name (`gitlab-tls`, the
+  cert-manager default). We work around this by minting the
+  CA + cert ourselves (`phase2/wildcard_certs.py`), writing
+  it to `infra/tls/wildcard/`, and materialising 4 Secrets
+  (`gitlab-wildcard-tls`, `registry-tls`, `kas-tls`,
+  `minio-tls`) before the GitLab chart install. The values
+  override in `references/helm-values-gitlab.yaml` flips
+  `global.ingress.tls.secretName: gitlab-wildcard-tls` so the
+  Gateway listeners find our Secret. Idempotent: the cert
+  has 10-year validity and the installer skips regen if
+  the cert has ≥30 days left.
+- **Stable PVs survive `tofu destroy`, but `--destroy` wipes
+  them.** The stable PV/PVC pairs (PostgreSQL, Redis,
+  Prometheus, Gitaly, MinIO, OpenBao) are bound to hostPath
+  dirs under `infra/data/shared/stable/`. After `tofu destroy
+  && tofu apply && bootstrap --phase 2`, the new cluster's
+  PVCs re-bind to those dirs. But the on-disk PostgreSQL
+  data was written with the credentials from the *previous*
+  install's chart-minted Secrets — and the chart mints fresh
+  random passwords on the next install, so PG logs
+  `FATAL: password authentication failed for user "gitlab"`.
+  The `persistent_secrets.py:restore()` step closes that loop
+  by re-applying the previous chart-managed Secrets BEFORE
+  the chart install (so the chart sees them already exist
+  and reuses them). The inverse case (testing fresh install
+  on top of stale data) is broken by design: that's what
+  `bootstrap --destroy` is for.
+- **`*.local.bruj0.net` resolves on the host, not in the
+  cluster.** The Gateway has 4 listeners, one per hostname
+  (`gitlab`, `registry`, `kas`, `minio`). Browsers reach
+  Envoy via the host's `/etc/hosts` mapping. Inside the
+  cluster, pods use Service DNS (`gitlab-webservice-default.gitlab.svc:8181`).
+  For curl from the host with port-forward, use
+  `curl --resolve <host>:8443:127.0.0.1 https://<host>:8443/...`
+  so the SNI matches the listener hostname — without SNI,
+  Envoy returns `filter_chain_not_found` and the TLS
+  handshake fails (`unexpected eof while reading`).
 
 - **Vendored CRDs, not the upstream tarball.** The
   `gateway-api-crds/` directory has 3 files: 1 upstream

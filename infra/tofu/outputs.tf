@@ -13,25 +13,13 @@ output "node_names" {
 }
 
 output "domain" {
-  value = var.domain
+  value       = var.domain
+  description = "*.wildcard the Phase 2 GitLab installer uses for global.hosts.domain (e.g. local.bruj0.net)."
 }
 
-output "ca_cert_path" {
-  description = "Path to the local CA cert (Phase 2 will use this to sign cert-manager issuers)."
-  value       = abspath("${path.module}/../tls/private/ca.crt")
-}
-
-output "ca_key_path" {
-  description = "Path to the local CA private key. NEVER committed (gitignored)."
-  value       = abspath("${path.module}/../tls/private/ca.key")
-}
-
-output "wildcard_cert_path" {
-  value = abspath("${path.module}/../tls/private/_.${var.domain}.crt")
-}
-
-output "wildcard_key_path" {
-  value       = abspath("${path.module}/../tls/private/_.${var.domain}.key")
+output "data_root" {
+  value       = abspath(var.data_root)
+  description = "Where the Phase 2 bootstrap places PersistentVolume data. Must be writable by the user running `tofu apply`."
 }
 
 output "phase_ready" {

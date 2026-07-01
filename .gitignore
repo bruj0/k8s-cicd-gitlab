@@ -26,6 +26,15 @@ infra/tofu/kubeconfig
 # mode 0700. NEVER commit these files.
 infra/secrets/
 
+# Persistent volume backing for chart-managed PVCs. Each GitLab subchart
+# (postgres, gitaly, redis, minio, registry, sidekiq, kas, prometheus, …)
+# creates a host directory under infra/data/shared/<pvc-name>-<uid>/ when
+# `blueprint-bootstrap --phase 2` runs. The whole tree is owned by the
+# current user after `tofu apply` (one-time sudo chown — see
+# docs/phase-1.md). The data survives `tofu destroy && tofu apply` by
+# design; commiting it would bloat the repo and leak auth state.
+infra/data/
+
 # Environment files (typically hold tokens, secrets, hostnames)
 .env
 .env.*

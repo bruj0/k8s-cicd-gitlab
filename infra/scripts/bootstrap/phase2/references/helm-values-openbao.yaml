@@ -38,6 +38,17 @@ server:
       cpu: 500m
       memory: 512Mi
 
+  # Pin the OpenBao data PVC to our pre-created PV. The chart
+  # uses volumeClaimTemplates (no existingClaim override), so
+  # we set storageClass=manual and stamp the PVC with our
+  # selector marker label. On cluster recreate the StatefulSet
+  # mints a fresh PVC named `data-openbao-0` with these
+  # labels, and our PV (selector match) binds to it.
+  dataStorage:
+    storageClass: manual
+    labels:
+      blueprint/stable-volume: openbao-data
+
 # Disable Injector for Phase 2 — we don't use Kubernetes auth method.
 injector:
   enabled: false

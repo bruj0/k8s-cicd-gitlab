@@ -1,6 +1,9 @@
 locals {
-  # Absolute host paths so the kind provider (which calls docker on the host) can resolve them.
-  data_root_abs   = abspath(var.data_root)
+  # Absolute host path so the kind provider (which calls docker on the host)
+  # can resolve the bind mount. The Phase 2 bootstrap wires a Kubernetes
+  # `local-path` StorageClass on top of this tree; chart-managed
+  # PersistentVolumeClaims then get a sub-directory under <shared_host_abs>
+  # per PVC. Host port 80/443 are reserved on the control-plane only.
   shared_host_abs = abspath("${var.data_root}/shared")
 
   # Resolve each node shape into a kind-style node spec.
@@ -11,8 +14,6 @@ locals {
         ["node.kubernetes.io/role=${n.role}"],
         n.role == "control-plane" ? ["ingress-ready=true"] : [],
       )
-      node_mount_host = n.role == "control-plane" ? null : abspath("${var.data_root}/node${n.node_index}")
-      node_mount_path = n.role == "control-plane" ? null : "/var/local/node${n.node_index}"
     })
   ]
 }

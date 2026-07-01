@@ -30,6 +30,13 @@
     "kindest_node_image": "kindest/node:v1.31.0"
   },
   "helm_repositories": {
+    "local-path-provisioner": {
+      "name": "local-path-provisioner",
+      "source": "https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml",
+      "version": "v0.0.30",
+      "kind": "kubectl-apply",
+      "comment": "Upstream applies directly via `kubectl apply -f <url>` (no helm chart). Version is pinned to the raw-manifest tag so a bump is one edit here."
+    },
     "headlamp": {
       "name": "headlamp",
       "url": "https://kubernetes-sigs.github.io/headlamp/",
@@ -71,7 +78,11 @@
             "installEnvoy": true,
             "configureCertmanager": false,
             "httpToHttpsRedirect": true
-          }
+          },
+          "storageClass": "local-path"
+        },
+        "certmanager-issuer": {
+          "email": "[email protected]"
         }
       }
     },

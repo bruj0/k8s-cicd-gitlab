@@ -29,16 +29,32 @@ The iteration loop is documented in
 from .catalog import Phase2Installers
 from .gateway import GATEWAY_API_STANDARD_URL, GatewayCRDsInstaller
 from .gitlab import GitlabCredentials, GitlabInstaller
+from .local_path_provisioner import LocalPathProvisionerInstaller
 from .openbao import OpenBaoInitOutput, OpenBaoInstaller
+from .persistent_secrets import (
+    PERSISTED_GITLAB_SECRETS, PersistentSecretsInstaller,
+)
 from .pipeline import Phase2Pipeline
 from .runner import GitLabRunnerInstaller
 from .secrets import OpenBaoClient
+from .stable_storage import STABLE_VOLUMES, StableStorageInstaller
+from .wildcard_certs import (
+    WILDCARD_LISTENER_SECRETS, WildcardCertPaths, WildcardCertsInstaller,
+)
 
 __all__ = [
     "Phase2Installers",
     "Phase2Pipeline",
     "GatewayCRDsInstaller",
     "GATEWAY_API_STANDARD_URL",
+    "LocalPathProvisionerInstaller",
+    "STABLE_VOLUMES",
+    "StableStorageInstaller",
+    "WILDCARD_LISTENER_SECRETS",
+    "WildcardCertPaths",
+    "WildcardCertsInstaller",
+    "PERSISTED_GITLAB_SECRETS",
+    "PersistentSecretsInstaller",
     "GitlabCredentials",
     "GitlabInstaller",
     "OpenBaoInitOutput",

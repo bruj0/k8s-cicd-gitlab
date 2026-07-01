@@ -35,6 +35,14 @@ global:
   # Ingress disabled — we route via Gateway API.
   ingress:
     enabled: false
+    # Declare the global ingress TLS secret so the chart's
+    # helper `gitlab.ingress.tls.configured` returns "true" and
+    # the chart skips its cfssl-self-sign pre-install Job (which
+    # would race / fail on an invalid ACME email). We mint this
+    # secret ourselves in Phase 2 (step: cert generation) so
+    # the Gateway listeners can resolve their certificateRefs.
+    tls:
+      secretName: gitlab-wildcard-tls
   # Activate the chart's Envoy Gateway sub-chart.
   gatewayApi:
     enabled: true
@@ -79,13 +87,64 @@ postgresql:
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 1000m, memory: 1Gi }
+  # Pin to the PV we pre-created in stable_storage.py so
+  # `tofu destroy && tofu apply` preserves PostgreSQL data
+  # (users, projects, CI variables). The PVC is
+  # `gitlab-postgresql` in the `gitlab` namespace.
+  primary:
+    persistence:
+      existingClaim: gitlab-postgresql
 
 redis:
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 500m, memory: 256Mi }
+  # Pin to the PV we pre-created in stable_storage.py so
+  # job queue and rate limits survive cluster recreates.
+  master:
+    persistence:
+      existingClaim: gitlab-redis
 
 minio:
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 250m, memory: 256Mi }
+  # Pin to the PV we pre-created in stable_storage.py (Flavor C:
+  # pvc_with_volume_name). The chart's minio_pvc.yaml creates a
+  # PVC named `gitlab-minio` and honours both `volumeName`
+  # (primary binding) and `matchLabels` (secondary safety net) on
+  # the PVC's spec — both pin to our pre-created PV. Without this
+  # the chart would create a fresh ephemeral PVC backed by the
+  # local-path provisioner and CI artifacts / LFS / uploads would
+  # be lost on every cluster recreate.
+  persistence:
+    volumeName: pv-gitlab-minio
+    # Same labels we stamp on the PV in stable_storage.py — the
+    # chart forwards these to the PVC's `spec.selector.matchLabels`.
+    matchLabels:
+      app: minio
+      release: gitlab
+      blueprint/stable-volume: minio
+      app.kubernetes.io/managed-by: blueprint-stable-storage
+
+prometheus:
+  server:
+    persistentVolume:
+      # Pin to the PV we pre-created in stable_storage.py so
+      # metrics history survives cluster recreates. The prometheus
+      # subchart (charts/prometheus/templates/deploy.yaml) keys off
+      # `persistentVolume.existingClaim` and creates a PVC named
+      # `gitlab-prometheus-server` when not pinned.
+      existingClaim: gitlab-prometheus-server
+
+gitlab:
+  gitaly:
+    persistence:
+      # Gitaly uses volumeClaimTemplates and doesn't expose
+      # existingClaim. Instead, we set storageClass=manual
+      # so the StatefulSet's volumeClaimTemplate creates a
+      # PVC that binds to our pre-created PV via selector
+      # match (labels app=gitlab-gitaly, release=gitlab,
+      # storage=default — these are stamped on the chart's
+      # volumeClaimTemplate PVCs).
+      storageClass: manual

@@ -81,6 +81,44 @@ from .app import BootstrapApp
         "token). Useful as a cheat sheet. (Phase 1 only.)"
     ),
 )
+@click.option(
+    "--port-forward",
+    "port_forward_target",
+    default=None,
+    metavar="TARGET",
+    help=(
+        "Forward a local port to a cluster service (e.g. 'gitlab' "
+        "forwards 127.0.0.1:8443 → chart-managed Envoy Gateway "
+        ":443). Blocks until interrupted. The kind cluster does not "
+        "expose 80/443 externally (no LoadBalancer IPs in kind), "
+        "so this is how the browser reaches GitLab at "
+        "https://gitlab.local.bruj0.net:8443."
+    ),
+)
+@click.option(
+    "--destroy",
+    "destroy",
+    is_flag=True,
+    help=(
+        "Wipe EVERYTHING the bootstrap manages: run `tofu destroy` "
+        "on infra/tofu to remove the kind cluster, then delete the "
+        "host-side tree under infra/data/ (preserved service data, "
+        "orphaned local-path-provisioner subdirs), infra/tls/wildcard/ "
+        "(self-signed CA + cert), infra/secrets/openbao-init.json "
+        "(root token + unseal key), and infra/secrets/gitlab-runtime-secrets.yaml "
+        "(chart-managed passwords). Use this when you want a true "
+        "from-scratch reset; the next `bootstrap --phase 2` will "
+        "recreate everything as if for the first time. Requires "
+        "`--yes` to actually run (otherwise just prints what it would "
+        "do)."
+    ),
+)
+@click.option(
+    "--yes",
+    "confirm_yes",
+    is_flag=True,
+    help="Skip the interactive confirmation prompt for --destroy.",
+)
 def main(
     phase: int,
     domain: str,
@@ -88,12 +126,21 @@ def main(
     skip_install: bool,
     dry_run: bool,
     user: bool,
+    port_forward_target: str | None,
+    destroy: bool,
+    confirm_yes: bool,
 ) -> int:
     """Run the bootstrap."""
+    if destroy:
+        return _run_destroy(confirm_yes, dry_run)
     # Translate click args into the argv shape BootstrapApp.from_argv
     # expects. Keeping BootstrapApp unchanged means we don't have to
     # touch the entire arg-parsing surface in one shot — the click
     # wrapper is a thin shim.
+    if port_forward_target is not None:
+        # Short-circuit: skip the bootstrap entirely and just keep
+        # the port-forward alive in the foreground.
+        return _run_port_forward(port_forward_target)
     argv: list[str] = []
     if phase != 1:
         argv += ["--phase", str(phase)]
@@ -113,6 +160,341 @@ def main(
     bootstrap_dir = Path(__file__).resolve().parent
     app = BootstrapApp.from_argv(bootstrap_dir, argv)
     return app.run()
+
+
+def _run_port_forward(target: str) -> int:
+    """Block forever, forwarding a host port to a cluster service.
+
+    Supported targets (the only one the blueprint currently needs is
+    `gitlab`):
+        gitlab   127.0.0.1:8443 → svc/envoy-<gateway>-<hash> :https-443
+                 on the chart-managed Envoy Gateway that fronts
+                 GitLab webservice + registry + kas + minio. We use
+                 host port 8443 (not 443) because kind's
+                 `extraPortMappings` already reserves 443 on the
+                 control-plane container for future use; binding
+                 443 from a port-forward would conflict.
+
+                 We forward to the gateway Service's named port
+                 `https-443` (whose targetPort is 10443, the port
+                 the Envoy proxy actually binds on). Forwarding
+                 to port 443 would not resolve because the
+                 Service has no service port 443 — only the named
+                 port `https-443` whose port field is 443.
+
+                 IMPORTANT: the Gateway has multiple listeners,
+                 one per hostname (gitlab.local.bruj0.net,
+                 registry.local.bruj0.net, kas.local.bruj0.net,
+                 minio.local.bruj0.net). All four are TLS-terminated
+                 by Envoy. To get the right cert back, the client
+                 must send SNI. For browsers that just means
+                 visiting `https://gitlab.local.bruj0.net:8443/...`
+                 (the SNI hostname is derived from the URL host).
+                 For `curl`, you need `--resolve <host>:8443:127.0.0.1`
+                 so the SNI matches the listener hostname.
+
+    For everything else (OpenBao UI, k9s) the existing
+    `bootstrap.secrets_cli ui` and `k9s` commands do the right
+    thing already — they're auto-managed by their respective
+    helpers.
+    """
+    import os
+    import signal
+    import subprocess
+
+    if target == "gitlab":
+        local_port = 8443
+        # Discover the Envoy Gateway Service — the chart picks a
+        # hash suffix that changes on every install/upgrade, so
+        # we must look it up rather than hard-code it.
+        svc_query = subprocess.run(
+            [
+                "kubectl", "-n", "gitlab",
+                "get", "svc",
+                "-l", "gateway.envoyproxy.io/owning-gateway-name=gitlab-gw",
+                "-o", "jsonpath={.items[0].metadata.name}",
+            ],
+            capture_output=True, text=True,
+        )
+        svc = svc_query.stdout.strip()
+        if not svc:
+            print(
+                "ERROR: GitLab Envoy Gateway service not found. "
+                "Run `bootstrap --phase 2` first.",
+                file=sys.stderr,
+            )
+            return 1
+        # Use the named port `https-443` rather than the numeric
+        # 443 — the Service has no port "443", only a named port
+        # whose `port:` field is 443 and `targetPort:` is 10443.
+        cmd = [
+            "kubectl", "-n", "gitlab",
+            "port-forward",
+            "--address", "127.0.0.1",
+            f"svc/{svc}",
+            f"{local_port}:https-443",
+        ]
+        print(
+            f"Forwarding 127.0.0.1:{local_port} → {svc}.gitlab.svc:https-443\n"
+            f"Visit: https://gitlab.local.bruj0.net:{local_port}/\n"
+            f"  (the URL host drives the SNI hostname that picks the\n"
+            f"   right Gateway listener + cert.)\n"
+            f"For curl: curl -k --resolve gitlab.local.bruj0.net:{local_port}:127.0.0.1 \\\n"
+            f"          https://gitlab.local.bruj0.net:{local_port}/users/sign_in\n"
+            f"(Press Ctrl+C to stop.)\n"
+        )
+    else:
+        print(
+            f"ERROR: unknown --port-forward target {target!r}. "
+            f"Supported: gitlab",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Replace this process with `kubectl port-forward` so Ctrl+C
+    # cleanly stops the forward (instead of the parent shell).
+    try:
+        os.execvp(cmd[0], cmd)
+    except KeyboardInterrupt:
+        return 0
+
+
+def _run_destroy(confirm_yes: bool, dry_run: bool) -> int:
+    """Wipe the entire blueprint state: cluster + preserved data + secrets.
+
+    Stages (each prints a clear `[destroy] <stage>` line):
+
+      1. `tofu destroy` on infra/tofu (kind cluster, port-forward
+         notes, kubeconfig file). Leaves host-side `infra/data/`
+         and `infra/secrets/` untouched — those are owned by the
+         bootstrap, not by tofu.
+      2. `infra/data/shared/stable/*` — preserved PostgreSQL,
+         Redis, Prometheus, Gitaly, MinIO, OpenBao state. Without
+         removing these, the next `bootstrap --phase 2` would
+         re-bind to the old data and (in particular) the PostgreSQL
+         password in `infra/secrets/gitlab-runtime-secrets.yaml`
+         would be silently overwritten, leaving GitLab's
+         migrations to fail with `password authentication failed`.
+      3. `infra/data/shared/*` (everything NOT under stable/) —
+         leftover PV dirs from previous helm chart installs that
+         local-path-provisioner renamed to `*.preserved-<ts>`
+         during its `teardown` mv. (See infra/scripts/bootstrap/phase2/
+         local_path_provisioner.py — the teardown script does
+         `mv`, not `rm`, so each PVC delete orphans a directory.)
+      4. `infra/tls/wildcard/*` — the self-signed CA + cert. The
+         next install regenerates these (10-year validity, so this
+         only matters if the cluster has been compromised).
+      5. `infra/secrets/openbao-init.json` — OpenBao's root token
+         + unseal key. The next install re-initialises OpenBao.
+      6. `infra/secrets/gitlab-runtime-secrets.yaml` — the chart's
+         snapshot of PostgreSQL/Redis/MinIO/Rails/Gitaly/KAS
+         passwords. The next install re-mints fresh ones.
+
+    Idempotent: each stage silently no-ops if its target doesn't
+    exist. Safe to re-run after a partial failure.
+
+    Args:
+        confirm_yes: skip the interactive y/N prompt (for scripts).
+        dry_run: print what would be removed without removing.
+    """
+    blueprint_root = Path(__file__).resolve().parent.parent.parent.parent
+    infra = blueprint_root / "infra"
+    tofu_dir = infra / "tofu"
+    data_shared = infra / "data" / "shared"
+    stable_dir = data_shared / "stable"
+    secrets_dir = infra / "secrets"
+    tls_wildcard = infra / "tls" / "wildcard"
+
+    stages: list[tuple[str, str, "Callable[[], None]"]] = [
+        (
+            "tofu destroy (kind cluster + kubeconfig + smoke test)",
+            str(tofu_dir),
+            lambda: _run_tofu_destroy(tofu_dir, dry_run),
+        ),
+        (
+            "stable service data (postgres/redis/prometheus/gitaly/minio/openbao)",
+            str(stable_dir),
+            lambda: _rm(stable_dir, dry_run, glob="*"),
+        ),
+        (
+            "leftover PV dirs from prior helm installs (*.preserved-*)",
+            str(data_shared),
+            lambda: _rm(data_shared, dry_run,
+                        glob="*.preserved-*", keep=["stable"]),
+        ),
+        (
+            "self-signed wildcard TLS cert + CA",
+            str(tls_wildcard),
+            lambda: _rm(tls_wildcard, dry_run, glob="*"),
+        ),
+        (
+            "OpenBao root token + unseal key",
+            str(secrets_dir / "openbao-init.json"),
+            lambda: _rm(secrets_dir / "openbao-init.json", dry_run),
+        ),
+        (
+            "GitLab chart-managed Secrets snapshot",
+            str(secrets_dir / "gitlab-runtime-secrets.yaml"),
+            lambda: _rm(secrets_dir / "gitlab-runtime-secrets.yaml", dry_run),
+        ),
+    ]
+
+    if not confirm_yes and not dry_run:
+        print(
+            "This will permanently remove:\n"
+            f"  - 1 kind cluster (via tofu destroy)\n"
+            f"  - {stable_dir}\n"
+            f"  - {data_shared} (orphaned *.preserved-* dirs only)\n"
+            f"  - {tls_wildcard}\n"
+            f"  - {secrets_dir / 'openbao-init.json'}\n"
+            f"  - {secrets_dir / 'gitlab-runtime-secrets.yaml'}\n"
+        )
+        try:
+            answer = input("Proceed? [y/N] ")
+        except EOFError:
+            answer = "n"
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return 0
+
+    print()
+    for name, path, action in stages:
+        marker = "[dry-run] " if dry_run else ""
+        print(f"{marker}[destroy] {name} ({path})")
+        try:
+            action()
+        except Exception as exc:
+            print(f"  ERROR: {exc}")
+            return 1
+    print()
+    print("[destroy] Done. Next step: `bootstrap --phase 2` will rebuild "
+          "the cluster from scratch.")
+    return 0
+
+
+def _run_tofu_destroy(tofu_dir: Path, dry_run: bool) -> None:
+    """Run `tofu destroy` in infra/tofu. No-op if no state exists."""
+    import subprocess
+    tfstate = tofu_dir / "terraform.tfstate"
+    if not tfstate.exists() and not dry_run:
+        print(f"  (no state at {tfstate}; skipping)")
+        return
+    cmd = ["tofu", "destroy", "-auto-approve"]
+    if dry_run:
+        cmd = ["tofu", "plan", "-destroy"]
+    result = subprocess.run(
+        cmd, cwd=str(tofu_dir),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"tofu destroy failed (rc={result.returncode}): "
+            f"{result.stderr.strip()}"
+        )
+    # Print a brief summary so the user sees something happened.
+    tail = "\n".join((result.stdout or "").splitlines()[-5:])
+    if tail:
+        print(f"  {tail.replace(chr(10), chr(10) + '  ')}")
+
+
+def _rm(path: Path, dry_run: bool, glob: str = "*", keep: list[str] | None = None) -> None:
+    """Recursively delete path matching glob, optionally keeping some names.
+
+    No-op if the target doesn't exist. Used by --destroy to wipe
+    specific host-side trees without touching siblings.
+    """
+    import shutil
+    if not path.exists():
+        print(f"  (does not exist; skipping)")
+        return
+    if path.is_file():
+        if dry_run:
+            print(f"  (dry-run: would delete {path})")
+        else:
+            path.unlink()
+            print(f"  deleted {path}")
+        return
+    keep_set = set(keep or [])
+    children = list(path.glob(glob)) if glob != "*" else list(path.iterdir())
+    if not children:
+        print(f"  (empty; skipping)")
+        return
+    for child in children:
+        if child.name in keep_set:
+            continue
+        if dry_run:
+            print(f"  (dry-run: would delete {child})")
+        elif child.is_dir():
+            # PV dirs are owned by the pod's runtime UID (e.g. openbao=100,
+            # postgres=1001) which our bootstrap user can't rmtree by
+            # default — and the inner files/dirs (mode 0700) are owned by
+            # the same UID, so neither chmod nor rm work from this user
+            # (sudo typically requires a password).
+            #
+            # Fall back to a one-shot privileged container that bind-
+            # mounts the path and rm's it for us. We try Docker first
+            # (most common), then Podman (rootless containers are fine
+            # for this since we only need to mutate the bind mount on
+            # the host). If neither is available, the user has to
+            # delete the dir manually with `sudo rm -rf`.
+            import subprocess
+            chmod = subprocess.run(
+                ["chmod", "-R", "a+rwX", str(child)],
+                capture_output=True, text=True,
+            )
+            if chmod.returncode == 0:
+                shutil.rmtree(child)
+                print(f"  deleted {child}/")
+                return
+            # chmod failed (likely EPERM on inner files we can't even
+            # read). Try a privileged container.
+            deleted = _rm_via_privileged_container(child)
+            if deleted:
+                print(f"  deleted {child}/ (via privileged container)")
+            else:
+                raise RuntimeError(
+                    f"could not delete {child}: chmod failed and no "
+                    f"container runtime is available. Run `sudo rm -rf "
+                    f"{child}` manually."
+                )
+        else:
+            child.unlink()
+            print(f"  deleted {child}")
+
+
+def _rm_via_privileged_container(path: Path) -> bool:
+    """Try to delete `path` via a one-shot privileged container.
+
+    Used as a fallback when host-side chmod/rm fails because the
+    tree is owned by a different UID (typical for kind PV dirs:
+    openbao runs as UID 100, postgres as 1001, etc.). The container
+    bind-mounts the parent dir read-write, then `rm -rf` the child.
+
+    Returns True on success, False if no usable container runtime
+    was found (in which case the caller surfaces a "run sudo rm -rf
+    manually" message).
+    """
+    import subprocess
+    parent = path.parent.resolve()
+    target = path.name
+
+    # Try docker first.
+    for runtime in ("docker", "podman"):
+        probe = subprocess.run(
+            ["which", runtime], capture_output=True, text=True,
+        )
+        if probe.returncode != 0:
+            continue
+        run = subprocess.run(
+            [runtime, "run", "--rm",
+             "-v", f"{parent}:/mnt:rw",
+             "alpine:latest",
+             "sh", "-c", f"chmod -R a+rwX /mnt && rm -rf /mnt/{target}"],
+            capture_output=True, text=True,
+        )
+        if run.returncode == 0:
+            return True
+    return False
 
 
 if __name__ == "__main__":

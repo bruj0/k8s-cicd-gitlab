@@ -85,9 +85,10 @@ blueprint/
 │   ├── phase-1.md
 │   └── prereqs.md
 └── infra/
-    ├── data/                            # ← hostPath source for the kind cluster (workers 1..4 + shared)
-    │   ├── node1..node4/                # bound to kind workers 1..4
-    │   └── shared/                      # bound to every kind node (incl. control-plane)
+    ├── data/                            # ← hostPath source for the kind cluster (gitignored).
+    │   └── shared/                      # bound to every kind node at /var/local/shared. Chart PVCs each
+    │                                    # get a sub-directory here via the local-path StorageClass
+    │                                    # (provisioner ship pathBase = /var/local/shared).
     ├── helm-charts/                     # locally cached charts (Headlamp, GitLab, Runner, OpenBao, ...)
     ├── scripts/
     │   ├── bootstrap.py                 # thin shim → delegates to bootstrap/ package
@@ -110,10 +111,14 @@ blueprint/
     │   │       ├── app_installer.py     # HelmAppInstaller generic + HeadlampInstaller subclass + installer_for() factory
     │   │       └── phase2/              # Phase 2: install GitLab + Runner + OpenBao (chart manages Envoy + cert)
     │   │           ├── __init__.py      # re-exports Phase2Pipeline + installers
-    │   │           ├── pipeline.py      # 5-step orchestrator (called from app.py:BootstrapApp)
+    │   │           ├── pipeline.py      # 9-step orchestrator (called from app.py:BootstrapApp)
     │   │           ├── catalog.py       # Phase2Installers dataclass (bundle of every installer)
     │   │           ├── gateway.py       # GatewayCRDsInstaller — upstream standard CRDs + chart-shipped Envoy CRDs
+    │   │           ├── local_path_provisioner.py  # local-path StorageClass + teardown patches data → mv + chmod
+    │   │           ├── stable_storage.py   # pre-create stable PV/PVC pairs (3 flavors: existing_claim, volume_claim_template, pvc_with_volume_name)
     │   │           ├── openbao.py       # OpenBaoInstaller — chart install + init/unseal
+    │   │           ├── wildcard_certs.py # mint self-signed CA + wildcard cert + 4 Gateway listener Secrets
+    │   │           ├── persistent_secrets.py # snapshot + restore chart-managed Secrets (postgres/redis/minio/rails/gitaly/kas)
     │   │           ├── secrets.py       # OpenBaoClient — hvac-backed client + auto port-forward
     │   │           ├── gitlab.py        # GitlabInstaller — chart + set-root-password + capture runner token
     │   │           ├── runner.py        # GitLabRunnerInstaller — registers against in-cluster Service DNS
@@ -122,7 +127,9 @@ blueprint/
     │   │               ├── helm-values-gitlab.yaml
     │   │               ├── helm-values-runner.yaml
     │   │               └── gateway-api-crds/   # 3 vendored CRDs (1 standard + 2 Envoy chart-shipped)
-    ├── secrets/                         # gitignored: OpenBao init JSON (mode 0700, see phase2/openbao.py)
+    ├── secrets/                         # gitignored, both files mode 0600
+    │   ├── openbao-init.json            # root token + unseal key (phase2/openbao.py)
+    │   └── gitlab-runtime-secrets.yaml  # chart-managed Secrets snapshot (phase2/persistent_secrets.py)
     ├── tofu/                            # OpenTofu configuration
     │   ├── providers.tf                 # kind ~> 0.11, helm ~> 3.0, local ~> 2.5, null ~> 3.2
     │   ├── variables.tf                 # cluster_name, kubernetes_version, node_shapes, kubeconfig_path, data_root, domain
@@ -133,8 +140,9 @@ blueprint/
     │   ├── tofu.tfvars                  # gitignored, real local overrides
     │   └── .terraform/, .terraform.lock.hcl  # generated
     └── tls/                             # generated PKI (gitignored)
-        ├── private/                     # ca.crt, ca.key, _.<domain>.{crt,key,csr,cnf}
-        └── public/                      # ca.crt (no keys)
+        └── wildcard/                    # bootstrap-minted CA + cert for *.local.bruj0.net
+                                        # (phase2/wildcard_certs.py). Reused across installs;
+                                        # --destroy removes it so the next install regenerates.
 ```
 
 ---
@@ -193,6 +201,33 @@ violate any of them, stop and ask.
      state) — partial states produce half-broken Phase 2 installs
      that are very hard to debug.
 
+4. **`bootstrap --destroy` is the symmetric teardown; it never recreates.**
+   The `--destroy` flag is the only way to wipe the **whole** blueprint
+   state from a single command. It runs (a) `tofu destroy`, then
+   (b) recursively removes bootstrap-owned host-side state:
+   - `infra/data/shared/stable/<service>/` — preserved PV data
+     (PostgreSQL, Redis, Prometheus, Gitaly, MinIO, OpenBao).
+   - `infra/data/shared/*.preserved-*` — orphaned local-path
+     provisioner dirs from past helm uninstalls.
+   - `infra/tls/wildcard/` — the self-signed CA + cert.
+   - `infra/secrets/openbao-init.json` — root token + unseal key.
+   - `infra/secrets/gitlab-runtime-secrets.yaml` — chart-managed
+     Secrets snapshot.
+   If a `stable/` subdir is owned by a pod UID that our user can't
+   unlink (openbao=100, postgres=1001), the destroy falls back to a
+   one-shot `docker run --rm` (or `podman run`) bind-mounting the
+   parent dir so the container can `chmod -R a+rwX && rm -rf` it.
+   **Why a single command matters**: stable PVs survive cluster
+   recreate (the point of `stable_storage.py`), but the on-disk
+   PostgreSQL data was created with credentials that no longer
+   match the freshly chart-minted Secrets. After 1+ `tofu destroy &&
+   apply && bootstrap --phase 2` cycle, GitLab logs
+   `FATAL: password authentication failed for user "gitlab"` and
+   never recovers. `--destroy` resets both halves (data + secrets)
+   in lock-step so the next install is a true clean slate. **Never
+   add an `--apply` style auto-recreate after `--destroy`** — the
+   user must run `tofu apply` themselves, per rule #1.
+
 ### Other rules (less strict but still apply)
 
 - **Shell scripts only if simple; otherwise Python following SOLID.**
@@ -211,6 +246,15 @@ violate any of them, stop and ask.
   them back via the `hvac` Python client (`OpenBaoClient`,
   `bootstrap-secrets` CLI), which auto-port-forwards
   `127.0.0.1:8200` to the `openbao` Service on first use.
+  The chart-managed Secrets (PostgreSQL/Redis/MinIO/Rails/Gitaly/KAS
+  passwords) are snapshotted to
+  `infra/secrets/gitlab-runtime-secrets.yaml` (mode 0600) at the
+  end of every successful install — that snapshot lets
+  `phase2/persistent_secrets.py:restore()` re-apply the same
+  values BEFORE the chart install on the next recreate, so the
+  chart sees the Secrets already exist and doesn't mint fresh
+  passwords that don't match the on-disk data. (This is the same
+  reason `--destroy` must wipe the snapshot too — see rule #4.)
 - **No hardcoded templates inside Python scripts.** All templates
   belong in their own files (a Jinja template, a yaml, etc.). The
   old Phase 1 PKI step generated an openssl cnf inline in

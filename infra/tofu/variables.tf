@@ -11,7 +11,7 @@ variable "kubernetes_version" {
 }
 
 variable "domain" {
-  description = "Base DNS domain used to compute the leaf cert's SAN list (must match pki.py)."
+  description = "Base DNS domain for the *.wildcard the chart mints (read by Phase 2 gitlab installer for global.hosts.domain). Not used by Phase 1."
   type        = string
   default     = "local.bruj0.net"
 }
@@ -23,7 +23,7 @@ variable "kubeconfig_path" {
 }
 
 variable "data_root" {
-  description = "Host directory that hosts blueprint/data/{nodeN,shared}. extraMounts bind sub-paths of this tree."
+  description = "Host directory whose `shared/` sub-path is bind-mounted onto every node at /var/local/shared. Phase 2 installs a local-path StorageClass on top of it; chart-managed PVCs then create their per-PVC sub-directories under <data_root>/shared/."
   type        = string
   default     = "../data"
 }
@@ -38,18 +38,17 @@ variable "node_shapes" {
   EOT
 
   type = list(object({
-    name        = string
-    role        = string           # 'gitlab' | 'runner' | 'control-plane'
-    memory      = string           # advisory (kind does not enforce); logged in node labels
-    cpu         = number           # advisory
-    node_index  = optional(number) # which blueprint/data/node<N> to bind; ignored for control-plane
+    name   = string
+    role   = string # 'gitlab' | 'runner' | 'control-plane'
+    memory = string # advisory (kind does not enforce); logged in node labels
+    cpu    = number # advisory
   }))
 
   default = [
-    { name = "gitlab-1", role = "gitlab", memory = "4Gi", cpu = 2, node_index = 1 },
-    { name = "gitlab-2", role = "gitlab", memory = "4Gi", cpu = 2, node_index = 2 },
-    { name = "gitlab-3", role = "gitlab", memory = "4Gi", cpu = 2, node_index = 3 },
-    { name = "runner",   role = "runner", memory = "8Gi", cpu = 4, node_index = 4 },
-    { name = "control-plane-1", role = "control-plane", memory = "4Gi", cpu = 2, node_index = 5 },
+    { name = "gitlab-1", role = "gitlab", memory = "4Gi", cpu = 2 },
+    { name = "gitlab-2", role = "gitlab", memory = "4Gi", cpu = 2 },
+    { name = "gitlab-3", role = "gitlab", memory = "4Gi", cpu = 2 },
+    { name = "runner",   role = "runner", memory = "8Gi", cpu = 4 },
+    { name = "control-plane-1", role = "control-plane", memory = "4Gi", cpu = 2 },
   ]
 }

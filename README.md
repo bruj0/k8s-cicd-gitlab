@@ -1,17 +1,13 @@
 # CICD Blueprint — self-hosted GitLab in k8s + CI/CD, end to end
 
-> One repo, one machine, one running pipeline. A 5-node kind
+> One repo, one machine, agentic driven. A 5-node kind
 > cluster hosts a self-managed GitLab (chart-bundled Envoy
 > Gateway terminates `*.local.example.net`), a registered Runner,
 > and OpenBao for secret injection. Push a commit, get a running
 > workload on `https://<app>.local.example.net`.
 
-This repo implements the local GitLab + k8s + CI/CD assignment
-described in [`../devops-take-home.md`](../devops-take-home.md) and
-[`../spec.md`](../spec.md): provision a local Kubernetes cluster with
-OpenTofu, build a GitLab CI pipeline that validates the IaC and a
-Helm chart, and deploy a small application end to end on
-self-hosted GitLab with its own Runner.
+This repo implements the GitLab + Gilab Runner + OpenBao + CI/CD templates provisioned in a local Kubernetes cluster with OpenTofu.
+The templates build a GitLab CI pipeline that builds, test and deploys apps to the self-hosted Gitlab.
 
 ## What you get after running this
 
@@ -22,6 +18,10 @@ self-hosted GitLab with its own Runner.
 | Self-registered GitLab Runner (executes CI on the same cluster) | `Admin → CI/CD → Runners` after Phase 2 |
 | Container Registry, KAS, MinIO (LFS/artifacts/packages) | `https://{registry,kas,minio}.local.example.net` |
 | OpenBao (KV v2 secret store) | `https://openbao.local.example.net` |
+| Stable PV/PVC pairs for PostgreSQL/Redis/Prometheus/Gitaly/MinIO/OpenBao | `infra/data/shared/stable/<service>/` (hostPath-backed, Retain policy). The chart PVCs bind to these by name so `tofu destroy && tofu apply` keeps the data — but a fresh install mints fresh credentials, so cross-cluster recreate is consistent only after `bootstrap --destroy` wipes stable/. |
+| Wildcard cert + CA for `*.local.bruj0.net` | `infra/tls/wildcard/` (10-year self-signed, reused across installs via `--destroy`) |
+| Chart-managed Secrets snapshot | `infra/secrets/gitlab-runtime-secrets.yaml` (mode 0600, written at the end of every successful Phase 2 install) |
+| One-shot teardown | `uv run blueprint-bootstrap --destroy [--yes] [--dry-run]` (cluster + stable/ + cert + secrets + OpenBao init JSON, with a privileged-container fallback for pod-UID-owned dirs) |
 | Sample workload (guestbook) packaged as a Helm chart | `apps/guestbook/helm-chart/` |
 | GitLab CI pipeline that validates and deploys | **Phase 3 — pending**. The chart is in place; the `.gitlab-ci.yml` is the next deliverable. See `docs/phase-1.md § Future` and the *Trade-offs* section below. |
 
@@ -50,7 +50,8 @@ flowchart LR
 In words:
 
 1. **Phase 1 — Cluster.** OpenTofu creates a 5-node kind cluster,
-   with per-node + shared hostPath mounts under `infra/data/`.
+   with a shared hostPath mount under `infra/data/shared/`
+   (chart-managed PVCs from Phase 2 land here too).
 2. **Phase 2 — Stack.** Bootstrap installs Gateway API CRDs,
    OpenBao, GitLab CE (which sub-installs Envoy Gateway and mints
    a self-signed wildcard cert for `*.local.example.net` via a
@@ -74,7 +75,7 @@ macOS, `kind` 0.27+, `kubectl`, `helm` ≥3.16, `tofu` 1.6+, `uv`
 
 ```sh
 git clone https://github.com/bruj0/k8s-cicd-gitlab.git
-cd k8s-cicd-gitlab/blueprint
+cd k8s-cicd-gitlab
 ```
 
 ### 2a. Hand it to an agent (recommended)
@@ -86,7 +87,7 @@ Codex) read directly as background context the moment the repo
 is opened. For agents that don't auto-discover, paste the skill
 file into the chat as a reference. The recommended loop:
 
-1. Open the `blueprint/` folder in your AI coding agent. If the
+1. Open the `k8s-cicd-gitlab/` folder in your AI coding agent. If the
    agent auto-loads skills (`<agent> skills` is a thing — see
    your agent's docs), the two skills are already in context.
    Otherwise paste
@@ -218,9 +219,33 @@ off, the right move is:
    should be a hard rule, and commit the docs in the same PR as
    the code fix.
 
-There's no separate "destroy" script — the only way to create or
-delete the cluster is `tofu -chdir=infra/tofu {apply,destroy}`.
-That rule is enforced as `AGENTS.md § 4 rule #3`.
+### Wiping the cluster + Phase 2 state
+
+The bootstrap ships a one-shot teardown that wipes **both** the
+infrastructure layer (the kind cluster, the kubeconfig) and
+the bootstrap-owned host-side state (preserved PV data under
+`infra/data/shared/stable/`, the chart-managed Secrets
+snapshot, the wildcard TLS cert + CA, OpenBao's init JSON):
+
+```sh
+uv run blueprint-bootstrap --destroy --yes    # skip confirm
+uv run blueprint-bootstrap --destroy --dry-run  # print only
+```
+
+`--destroy` runs `tofu destroy` (cluster lifecycle is owned by
+OpenTofu; see `AGENTS.md § 4 rule #3`), then recursively removes
+the bootstrap's host-side state. PV dirs that the
+local-path-provisioner mv'd to `*.preserved-<ts>` are also
+cleaned up. If a PV dir is owned by a pod UID (e.g.
+`openbao` runs as UID 100, `postgres` as UID 1001) and the
+unprivileged `rm` fails, `--destroy` falls back to a one-shot
+Docker/Podman privileged container that bind-mounts the parent
+dir and `rm -rf`'s the child. The result: a clean slate for
+the next `uv run blueprint-bootstrap --phase 2`.
+
+The **only** way to create the cluster is `tofu -chdir=infra/tofu
+apply -auto-approve`. `--destroy` only tears down; it never
+re-creates.
 
 ## How the bootstrap + skills fit together
 
@@ -237,6 +262,7 @@ infra/scripts/
     ├── __main__.py              # python -m bootstrap → same entry as the console script
     ├── VERSIONS.json            # pinned versions, single source of truth
     ├── cli.py                   # click wrapper → blueprint-bootstrap entry point
+    │                           # + `--destroy` / `--port-forward` / `--dry-run` / `--user`
     ├── secrets_cli.py           # click wrapper → blueprint-secrets entry point
     ├── app.py                   # composition root: BootstrapApp wires phases → installers
     ├── prereq.py                # Phase 1 prereq check + installer
@@ -246,11 +272,18 @@ infra/scripts/
     ├── os_detect.py             # apt / dnf / pacman / brew branching
     ├── shell.py                 # idempotent subprocess wrapper (logs every command)
     ├── logger.py, versions.py, installer.py
-    └── phase2/                  # Phase 2 only
-        ├── pipeline.py          # orchestrates the 5 Phase 2 installers in order
+    └── phase2/                  # Phase 2 only — 9 steps orchestrated by Phase2Pipeline
+        ├── pipeline.py          # orchestrates the 9 Phase 2 steps in order
+        ├── catalog.py           # Phase2Installers dataclass (bundle of every installer)
         ├── gateway.py           # Gateway API CRDs + chart-shipped Envoy CRDs
+        ├── local_path_provisioner.py  # local-path StorageClass + `local-path` as default
+        ├── stable_storage.py    # pre-create stable PV/PVC pairs (3 flavors: existing_claim,
+        │                        # volume_claim_template, pvc_with_volume_name)
         ├── openbao.py           # OpenBao chart install + init + unseal
-        ├── gitlab.py            # GitLab chart install + first-boot rails
+        ├── wildcard_certs.py    # mint self-signed CA + wildcard cert + 4 listener Secrets
+        ├── persistent_secrets.py # snapshot + restore chart-managed Secrets (postgres/redis/
+        │                        # minio/rails/gitaly/kas) so `tofu destroy && apply` works
+        ├── gitlab.py            # GitLab chart install + first-boot rails + token capture
         ├── runner.py            # Runner chart install, registers against gitlab.svc:8181
         ├── secrets.py           # hvac client (OpenBao) with shared port-forward
         └── references/          # vendored Gateway API + Envoy CRDs, chart fragments
@@ -426,8 +459,7 @@ both humans and AI agents touching this repo.
 These are the calls we made deliberately — they're the questions
 a reviewer is most likely to ask.
 
-- **Why OpenTofu and not Terraform.** Assignment asked for one or
-  the other; OpenTofu is the OSS fork and the prereqs installer
+- **Why OpenTofu and not Terraform.**  OpenTofu is the OSS fork and the prereqs installer
   covers both apt/dnf/pacman/brew.
 - **Why kind and not minikube/k3d.** kind's per-container
   hostPath mounts (used for the per-node + shared volumes in
@@ -440,9 +472,8 @@ a reviewer is most likely to ask.
   Gateway as `gateway-helm` sub-chart, so the same wildcard cert
   handles GitLab, the Registry, KAS, MinIO, and (Phase 3) the
   deployed app.
-- **Why Phase 2 ships one Runner (executor), not a fleet.** Same
-  reasoning the assignment implies — a single executor inside the
-  cluster is enough for the validator + deploy jobs.
+- **Why Phase 2 ships one Runner (executor), not a fleet.** A single executor inside the
+  cluster is enough for the validation + deploy jobs.
 - **Why a runner-in-pod and not a shell executor.** The runner is
   registered with `kubernetes` executor; jobs spin up ephemeral
   pods. That keeps CI workloads inside the same RBAC boundary as
@@ -454,13 +485,22 @@ a reviewer is most likely to ask.
   `openbao.openbao.svc:8200`) for in-cluster traffic. The
   distinction is encoded as a rule in `AGENTS.md` so future
   contributors don't paper over it with a clever alias.
-- **What we'd do with more time.** (1) Move TLS to cert-manager +
-  Let's Encrypt once a real DNS name is delegated. (2) Add a
-  `dispose` subcommand to `blueprint-bootstrap` that runs the
-  reverse of every phase (`helm uninstall → tofu destroy`) with a
-  confirmation prompt. (3) Wire the chart cache into Helm's OCI
+- **What we'd do with more time.**
+  1. Move TLS to cert-manager +
+  Let's Encrypt once a real DNS name is delegated.
+  2. ~~Add a `dispose` subcommand~~ (done: `blueprint-bootstrap
+     --destroy [--yes] [--dry-run]` — wipes cluster + stable/ +
+     chart-managed Secrets snapshot + wildcard cert + OpenBao
+     init JSON. Privilege container fallback for pod-UID-owned
+     PV dirs.)
+  3. Wire the chart cache into Helm's OCI
   cache (`helm pull --untar`) so we don't re-download on every
-  re-run when `VERSIONS.json` bumps. (4) Replace the in-cluster
-  MinIO with object storage fronted by the same wildcard. (5) Add
-  a real `step-ca` or `cfssl`-as-a-Service for the wildcard,
-  outside the chart, so we can re-issue without nuking GitLab.
+  re-run when `VERSIONS.json` bumps.
+  4. Promote Phase 2's chart-managed Secrets snapshot
+     (`gitlab-runtime-secrets.yaml`) from
+     `--destroy --yes` reset to an opt-in `--preserve` mode so
+     `tofu destroy && tofu apply && bootstrap --phase 2`
+     preserves GitLab users / repos / CI variables across the
+     cluster recreate — the snapshot mechanism is already in
+     place, just needs a `--no-wipe-stable` flag. 
+ 

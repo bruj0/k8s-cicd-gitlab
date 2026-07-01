@@ -18,34 +18,35 @@ resource "kind_cluster" "cicd" {
       content {
         role = node.value.role_kind
 
-        # Per-node extraMounts (control-plane skipped — it owns no data slot).
-        dynamic "extra_mounts" {
-          for_each = node.value.node_mount_host == null ? [] : [node.value.node_mount_host]
-          content {
-            host_path      = extra_mounts.value
-            container_path = node.value.node_mount_path
-            read_only      = false
-            propagation    = "Bidirectional"
-          }
-        }
-
-        # Shared extraMount on EVERY node, including control-plane.
+        # Shared hostPath bind for the `local-path` StorageClass
+        # (pathBase = /var/local/shared, host source = infra/data/shared).
+        # Each service (postgres, gitaly, registry, minio, redis, kas,
+        # prometheus, rails/uploads, openbao) gets its own sub-directory
+        # under infra/data/shared and survives cluster recreate.
+        #
+        # IMPORTANT: do NOT set `propagation = "Bidirectional"` on this
+        # mount. With a real-fs host source (ext4 on /mnt/data), rshared
+        # propagation causes the host's bind-source files to be deleted
+        # when the kind container is destroyed — the host sees the
+        # container's umount as a propagation event and the kernel
+        # sweeps the source. Default (rprivate) bind propagation is enough
+        # for local-path-provisioner to work because it never needs to
+        # publish mounts from the container back to the host.
         extra_mounts {
           host_path      = local.shared_host_abs
           container_path = "/var/local/shared"
           read_only      = false
-          propagation    = "Bidirectional"
         }
 
         labels = {
           for l in node.value.labels : split("=", l)[0] => split("=", l)[1]
         }
 
-        # Only the control-plane reserves host ports 80/443 for the Phase 2
-        # Traefik entrypoint. Putting the mapping on every node would make
-        # docker reject the second container that tries to claim 127.0.0.1:80.
-        # TODO(phase-2): reassign these mappings if Traefik ends up on a
-        # dedicated node.
+        # Only the control-plane reserves host ports 80/443 so the
+        # chart-managed Envoy Gateway can serve the *.local.<domain>
+        # wildcard on the same address that /etc/hosts binds it to. Putting
+        # the mapping on every node would make docker reject the second
+        # container that tries to claim 127.0.0.1:80.
         dynamic "extra_port_mappings" {
           for_each = node.value.role_kind == "control-plane" ? [1] : []
           content {

@@ -127,6 +127,8 @@ class GitlabInstaller(HelmAppInstaller):
         self._log.ok("GitLab credentials captured into OpenBao")
         return result
 
+    # ---------- (no post-install patches — port-forward is the access path) ----------
+
     # ---------- internals ----------
 
     def _ensure_initial_password(self) -> str:

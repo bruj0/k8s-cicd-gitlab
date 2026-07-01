@@ -101,17 +101,23 @@ docker ps --format '{{.Names}}\t{{.Status}}' | grep ^cicd-
 kubectl get nodes -o wide
 # Expected: 5 rows, all STATUS=Ready, 1 control-plane + 4 workers.
 
-# 3. Per-node hostPath mounts are reachable from inside each
-#    container. The host source is infra/data/{nodeN,shared}/
-#    (the data_root variable in infra/tofu/tofu.tfvars defaults
-#    to "../data", which resolves to infra/data/). To verify the
-#    mount round-trips, write from the host (needs sudo — see
-#    the "common pitfalls" entry for why) and read from inside
-#    the container:
-echo "probe-$$" | sudo tee infra/data/node1/probe.txt > /dev/null
-docker exec cicd-worker cat /var/local/node1/probe.txt
-sudo rm -f infra/data/node1/probe.txt
-# Expected: prints "probe-<pid>".
+# 3. The shared hostPath is reachable from inside every node.
+#    The host source is infra/data/shared/ (the `data_root`
+#    variable in infra/tofu/tofu.tfvars defaults to "../data",
+#    which resolves to infra/data/shared). Phase 2 wires a
+#    `local-path` StorageClass on top, so PVCs land here too.
+#    Round-trip test (write from the host — see the
+#    "common pitfalls" entry for sudo), read from inside the
+#    container:
+echo "probe-$$" | tee infra/data/shared/probe.txt > /dev/null
+docker exec cicd-worker cat /var/local/shared/probe.txt
+rm -f infra/data/shared/probe.txt
+# Expected: prints "probe-<pid>" (note: Phase 1 wrote a real file
+# to infra/data/shared/ just now. The local-path-provisioner
+# installs at Phase 2 and creates per-PVC sub-directories under
+# infra/data/shared/ — those don't clash with this scratch test
+# because the provisioner uses `<pvc-name>-<uid>/` and the
+# provisioner is the only writer to that namespace).
 
 # 4. Headlamp is installed + has a NodePort.
 kubectl -n headlamp get deploy,svc,pods
@@ -199,10 +205,10 @@ edit the right file, and move on.
 - `error: You must be logged in to the server (Unauthorized)` from any `kubectl` command → the kubeconfig at `infra/tofu/kubeconfig` was written by an older `tofu apply` and the kind node cert rotated. Re-run `tofu -chdir=infra/tofu apply -auto-approve` (idempotent) to rewrite it.
 - `Headlamp pod stuck in CrashLoopBackOff` with `ImagePullBackOff` in Events → the headlamp container image pull rate-limited. The chart is installed by you (not the bootstrap), so re-run the helm upgrade with `--set image.pullPolicy=IfNotPresent` and it'll use the local image cache.
 - `docker exec` returns "No such container: kind-cicd-..." → kind 0.27+ no longer prefixes container names with `kind-`. The actual names are `cicd-control-plane`, `cicd-worker`, `cicd-worker2`, `cicd-worker3`, `cicd-worker4`. Look at `docker ps` to see the real names.
-- `Permission denied` writing to `infra/data/nodeN/` from the host as a non-root user → the bind-mount targets are created by kind as `root:root 755` on the first `tofu apply`. The bootstrap can't `chown` (root-only) and won't try. Two options: (1) `sudo chown -R $USER:users infra/data/` once after the first `tofu apply`, or (2) write through `sudo tee ... > /dev/null` for individual files. Option 1 is one-and-done and the recommended fix; option 2 is fine for ad-hoc smoke tests.
+- `Permission denied` writing to `infra/data/shared/` from the host as a non-root user → the bind-mount target is created by kind as `root:root 755` on the first `tofu apply`. The bootstrap can't `chown` (root-only) and won't try. One option: `sudo chown -R $USER:users infra/data/shared/` once after the first `tofu apply`. The `local-path` provisioner (Phase 2 step 3) also runs as non-root in the kind worker and may try to write under `infra/data/shared/`; same fix applies.
 - **CRITICAL: the only way to create or delete the cluster is `tofu`.** No `kind create cluster --name=cicd`, no `docker rm -f cicd-*`, no `kubectl delete namespace` to "tidy up". See AGENTS.md § 4 rule #3. The tofu state file at `infra/tofu/terraform.tfstate` is the source of truth; if `tofu state list` is non-empty when `docker ps | grep ^cicd-` is empty, the cluster is in a weird state — fix with `tofu state rm <orphan>` (per resource), not hand-deletion of state.
 - **CRITICAL: the bootstrap is preparation-only.** It runs `tofu init` and `tofu validate` but **never** `tofu plan` or `tofu apply`. If you find yourself wanting to add a `--apply` flag to the bootstrap, stop — see AGENTS.md § 4 rule #1.
-- The `infra/data/*` hostPath mounts persist across `tofu destroy` → that's by design. Delete them manually (`rm -rf infra/data/node{1..4}/* infra/data/shared/*`) only when you want a clean slate.
+- `infra/data/shared/*` hostPath mount persists across `tofu destroy` → that's by design (it's the PVC backing store). Delete it manually (`sudo rm -rf infra/data/shared/*`) only when you want to reset GitLab data; deleting it without also resetting the chart will leave the chart's statefulset confused.
 
 ## Rules of thumb (apply when adding Phase-1 pieces)
 

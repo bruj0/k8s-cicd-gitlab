@@ -51,6 +51,10 @@ from .phase2 import (
     OpenBaoClient, Phase2Installers, Phase2Pipeline,
 )
 from .phase2.gateway import GatewayCRDsInstaller
+from .phase2.local_path_provisioner import LocalPathProvisionerInstaller
+from .phase2.persistent_secrets import PersistentSecretsInstaller
+from .phase2.stable_storage import StableStorageInstaller
+from .phase2.wildcard_certs import WildcardCertsInstaller
 from .prereq import PrereqRegistry
 from .shell import CommandRunner, DryRunRunner, SubprocessRunner
 from .tofu import TofuRunner
@@ -160,12 +164,26 @@ class BootstrapApp:
         #
         # The reverse proxy is delivered by the GitLab chart's
         # `gateway-helm` sub-chart (Envoy Gateway). The TLS cert is
-        # delivered by the chart's `shared-secrets/self-signed-cert-job`
-        # pre-install hook (cfssl self-sign, no DNS challenges).
-        self._phase2_openbao_client = OpenBaoClient(runner, paths, log)
+        # minted by `WildcardCertsInstaller` because the chart's
+        # `shared-secrets/self-signed-cert-job` pre-install hook is
+        # gated on a helper that returns "true" when Gateway API is
+        # on, which skips the Job and leaves the listener Secrets
+        # unresolved.
+        self._phase2_openbao_client = OpenBaoClient(
+            runner, paths, log,
+            init_file=paths.secrets_dir / "openbao-init.json",
+        )
         self._phase2_installers = Phase2Installers(
             crds=GatewayCRDsInstaller(runner, paths, log),
+            local_path=LocalPathProvisionerInstaller(runner, paths, log),
+            stable_storage=StableStorageInstaller(runner, paths, log),
             openbao=OpenBaoInstaller(runner, paths, self.chart_cache, log),
+            wildcard_certs=WildcardCertsInstaller(
+                runner, paths, log,
+                namespace="gitlab",
+                domain=args.domain,
+            ),
+            persistent_secrets=PersistentSecretsInstaller(runner, paths, log),
             gitlab=GitlabInstaller(runner, paths, self.chart_cache, log, self._phase2_openbao_client),
             runner=GitLabRunnerInstaller(runner, paths, self.chart_cache, log, self._phase2_openbao_client),
         )
@@ -311,7 +329,7 @@ class BootstrapApp:
         args = self.args
         family, distro = detect_os()
 
-        self._banner("Phase 2 bootstrap — install GitLab + Runner + OpenBao (chart-managed Envoy Gateway + self-signed wildcard cert)")
+        self._banner("Phase 2 bootstrap — install GitLab + Runner + OpenBao (chart-managed Envoy Gateway + self-signed wildcard cert + local-path StorageClass)")
         self._app(f"Blueprint root: {self.paths.blueprint_dir}")
         self._app(f"OS family:      {family}{f' ({distro})' if distro else ''}")
         mode = self._describe_mode(args)
@@ -323,10 +341,17 @@ class BootstrapApp:
             self._app("This will:")
             self._app("    1. pre-flight (cluster reachable, helm installed)")
             self._app("    2. install Gateway API CRDs (Envoy needs them upstream)")
-            self._app("    3. install + initialise + unseal OpenBao")
-            self._app("    4. install GitLab — chart bundles Envoy Gateway + mints")
+            self._app("    3. install local-path-provisioner + mark `local-path`")
+            self._app("       as the default StorageClass (chart PVCs land on")
+            self._app("       infra/data/shared/ and survive cluster recreate)")
+            self._app("    4. pre-create stable PV/PVC pairs at known host paths")
+            self._app("       for OpenBao + GitLab subcomponents (so `tofu destroy`")
+            self._app("       + `tofu apply` preserves identity — chart subcharts")
+            self._app("       are pinned to these via `existingClaim`)")
+            self._app("    5. install + initialise + unseal OpenBao")
+            self._app("    6. install GitLab — chart bundles Envoy Gateway + mints")
             self._app("       a self-signed wildcard cert for *.local.bruj0.net")
-            self._app("    5. install GitLab Runner (gitlabUrl points at")
+            self._app("    7. install GitLab Runner (gitlabUrl points at")
             self._app("       gitlab-webservice-default.gitlab.svc:8181)")
             self._app("")
             self._app("DNS hint: add `127.0.0.1 gitlab.local.bruj0.net registry.local.bruj0.net")

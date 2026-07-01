@@ -84,6 +84,7 @@ class _PortForward:
     def __init__(self, runner: CommandRunner, log: Logger) -> None:
         self._r = runner
         self._log = log
+        self._is_dry_run = isinstance(runner, DryRunRunner)
         self._proc: subprocess.Popen[bytes] | None = None
         self._local_lock = threading.Lock()
 
@@ -299,6 +300,43 @@ class OpenBaoClient:
 
     # ---------- compatibility shim (used by tests / debugging) ----------
 
+    def operator_init(self, *, key_shares: int, key_threshold: int) -> dict:
+        """Run `bao operator init` via hvac.
+
+        Returns the parsed JSON dict (root_token + unseal_keys_b64).
+        Raises if the server is already initialised.
+        """
+        if self._is_dry_run:
+            return {
+                "root_token": "dryrun-root-token",
+                "unseal_keys_b64": ["dryrun-unseal-key-base64=="],
+            }
+        client = self._anonymous()
+        resp = client.sys.initialize(secret_shares=key_shares, secret_threshold=key_threshold)
+        data = resp  # hvac returns the dict directly
+        return {
+            "root_token": data["root_token"],
+            "unseal_keys_b64": data["keys_base64"],
+        }
+
+    def operator_unseal(self, key: str) -> dict:
+        """Run `bao operator unseal <key>` via hvac.
+
+        Returns the parsed status dict. Idempotent (calling on an
+        already-unsealed server is a no-op that returns the sealed=false
+        status).
+        """
+        if self._is_dry_run:
+            return {"sealed": False, "progress": 1, "t": 1}
+        client = self._anonymous()
+        resp = client.sys.submit_unseal_key(key)
+        # hvac returns the unseal status dict.
+        return {
+            "sealed": resp.get("sealed", False),
+            "t": resp.get("t", 1),
+            "progress": resp.get("progress", 0),
+        }
+
     def raw(self, bao_cmd: list[str], *, check: bool = True,
             stdin: str | None = None) -> Any:
         """Backwards-compat shim — emulates the old `bao <args>` exec.
@@ -310,8 +348,10 @@ class OpenBaoClient:
         for new code.
 
         Translates a tiny subset of `bao` invocations to the
-        equivalent hvac calls. Anything we don't recognise falls
-        back to a no-op so old test code doesn't crash on a
+        equivalent hvac calls. Operator commands (init / unseal)
+        get first-class handling here so the bootstrap's init +
+        unseal flow actually works. Anything we don't recognise
+        falls back to a no-op so old test code doesn't crash on a
         rebuild.
         """
         if self._is_dry_run:
@@ -346,6 +386,47 @@ class OpenBaoClient:
             if path is not None:
                 self._enable_kv_raw(path, version=version)
             return _FakeResult(True, "", "")
+        # `bao operator init -key-shares=N -key-threshold=M -format=json`
+        if len(bao_cmd) >= 2 and bao_cmd[0] == "operator" and bao_cmd[1] == "init":
+            shares, threshold = 1, 1
+            for arg in bao_cmd:
+                if arg.startswith("-key-shares="):
+                    shares = int(arg.split("=", 1)[1])
+                elif arg.startswith("-key-threshold="):
+                    threshold = int(arg.split("=", 1)[1])
+            try:
+                data = self.operator_init(key_shares=shares, key_threshold=threshold)
+                return _FakeResult(True, json.dumps(data), "")
+            except Exception as e:
+                return _FakeResult(False, "", str(e))
+        # `bao operator unseal <key>`
+        if len(bao_cmd) >= 3 and bao_cmd[0] == "operator" and bao_cmd[1] == "unseal":
+            try:
+                data = self.operator_unseal(bao_cmd[2])
+                return _FakeResult(True, json.dumps(data), "")
+            except Exception as e:
+                return _FakeResult(False, "", str(e))
+        # `bao status` → use hvac's typed accessors. The /sys/health
+        # endpoint returns 501 when the server is uninitialised, which
+        # is exactly the state we want to detect here, so we can't use
+        # a naive GET. Instead, `sys.is_initialized()` (HEAD-like) and
+        # `sys.read_seal_status()` (GET /sys/seal-status) for sealed.
+        if len(bao_cmd) >= 1 and bao_cmd[0] == "status":
+            if self._is_dry_run:
+                return _FakeResult(True, json.dumps({"sealed": True, "initialized": False}), "")
+            try:
+                client = self._anonymous()
+                initialized = bool(client.sys.is_initialized())
+                sealed = True
+                if initialized:
+                    seal = client.sys.read_seal_status(method="GET")
+                    sealed = bool(seal.get("sealed", True))
+                return _FakeResult(True, json.dumps({
+                    "sealed": sealed,
+                    "initialized": initialized,
+                }), "")
+            except Exception as e:
+                return _FakeResult(False, "", str(e))
         # Fallback: not implemented via hvac.
         return _FakeResult(True, "", "")
 

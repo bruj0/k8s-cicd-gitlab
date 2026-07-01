@@ -93,7 +93,29 @@ class OpenBaoInstaller(HelmAppInstaller):
         return self._paths.secrets_dir / INIT_FILE_NAME
 
     def is_initialised(self) -> bool:
-        return self.init_file_path().exists()
+        """True if the on-disk init JSON exists AND the server reports
+        itself as initialised.
+
+        Both checks are needed because the on-disk file can be stale
+        (from a destroyed cluster or a successful install before the
+        server was wiped). If the file exists but the server is
+        uninitialised (e.g. fresh cluster after `tofu destroy &&
+        tofu apply`), we treat the system as "not initialised" so
+        `_init()` re-runs and rewrites the file.
+        """
+        if not self.init_file_path().exists():
+            return False
+        # Cross-check with the server. If the server isn't reachable,
+        # fall back to the file-presence check (best-effort).
+        try:
+            result = self._client.raw(["status"], check=False)
+            if result.ok:
+                import json
+                payload = json.loads(result.stdout)
+                return bool(payload.get("initialized", False))
+        except Exception:
+            pass
+        return True  # file exists; trust it if we can't probe the server
 
     def is_sealed(self) -> bool:
         """Returns True if the OpenBao server is sealed (needs unseal).

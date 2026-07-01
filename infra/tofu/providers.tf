@@ -8,14 +8,16 @@ terraform {
       version = "~> 0.11"
     }
 
-    # Pinned for Phase 2 (GitLab + OpenBao + Traefik will be installed via helm_release).
+    # Pinned for Phase 2 smoke-test validation (Phase 2 itself drives `helm install`
+    # via CommandRunner, not via this provider).
     helm = {
       source  = "hashicorp/helm"
       version = "~> 3.0"
     }
 
-    # Used to (a) emit a side-by-side kubeconfig with localhost endpoints,
-    # (b) stage the wildcard cert into a path cert-manager can pick up later.
+    # Used to emit a side-by-side kubeconfig with localhost endpoints so
+    # external `kubectl` sessions can talk to the cluster without needing
+    # the kind-provider port-forward.
     local = {
       source  = "hashicorp/local"
       version = "~> 2.5"

@@ -22,6 +22,13 @@ class Paths:
     # Phase 2 paths
     secrets_dir: Path          # .../blueprint/infra/secrets  (gitignored)
     phase2_refs_dir: Path      # .../blueprint/infra/scripts/bootstrap/phase2/references
+    # PersistentVolume backing (hostPath on each kind node).
+    # infra/data/  — gitignored; tofu binds <root>/shared onto every node
+    # at /var/local/shared. The Phase 2 bootstrap wires rancher/
+    # local-path-provisioner on top so chart-managed PVCs each get a
+    # sub-directory under infra/data/shared/.
+    data_dir: Path             # .../blueprint/infra/data
+    data_shared: Path          # .../blueprint/infra/data/shared
 
     @classmethod
     def from_bootstrap_dir(cls, bootstrap_dir: Path) -> "Paths":
@@ -39,10 +46,12 @@ class Paths:
             helm_charts_dir=infra / "helm-charts",
             secrets_dir=infra / "secrets",
             phase2_refs_dir=bootstrap_dir / "phase2" / "references",
+            data_dir=infra / "data",
+            data_shared=infra / "data" / "shared",
         )
 
     def ensure_dirs(self) -> None:
-        for d in (self.tls_private, self.tls_public, self.helm_charts_dir):
+        for d in (self.tls_private, self.tls_public, self.helm_charts_dir, self.data_shared):
             d.mkdir(parents=True, exist_ok=True)
 
     def ensure_secrets_dir(self) -> None:

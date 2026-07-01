@@ -46,16 +46,20 @@ fails, fix the underlying issue before continuing.
 uv run blueprint-bootstrap --phase 2
 ```
 
-Five steps, all idempotent. Re-running the command after a partial
+Nine steps, all idempotent. Re-running the command after a partial
 failure resumes from the failed step.
 
 | Step | What it does |
 | ---- | ------------ |
-| 1/5  | Pre-flight (cluster + helm reachable) |
-| 2/5  | Install the Gateway API CRDs (upstream standard channel + the 2 chart-shipped Envoy CRDs the GitLab chart needs) |
-| 3/5  | Install + initialise + unseal OpenBao |
-| 4/5  | Install GitLab CE (the chart sub-installs Envoy Gateway 1.7.1 and mints a self-signed wildcard cert for `*.local.bruj0.net` via its pre-install cfssl Job); set the root password via Rails; capture the runner registration token into OpenBao |
-| 5/5  | Install GitLab Runner (uses the registration token from OpenBao) |
+| 1/9  | Pre-flight (cluster + helm reachable) |
+| 2/9  | Install the Gateway API CRDs (upstream standard channel + the 2 chart-shipped Envoy CRDs the GitLab chart needs) |
+| 3/9  | Install `rancher/local-path-provisioner` + mark `local-path` as the default StorageClass + bind pathBase to `/var/local/shared` so chart PVCs land on `infra/data/shared/` |
+| 4/9  | Pre-create stable PV/PVC pairs (PostgreSQL, Redis, Prometheus, Gitaly, MinIO, OpenBao) so the cluster recreate doesn't lose state |
+| 5/9  | Install + initialise + unseal OpenBao |
+| 6/9  | Mint the self-signed wildcard cert + CA + materialise the 4 Gateway listener Secrets (the chart's pre-install cfssl Job is skipped when Gateway API is on, so we do it ourselves) |
+| 7/9  | Restore chart-managed Secrets from the host-side snapshot (`infra/secrets/gitlab-runtime-secrets.yaml`) so the chart re-uses the same credentials as the on-disk PV data — without this, PG logs `password authentication failed` after every cluster recreate |
+| 8/9  | Install GitLab CE (the chart sub-installs Envoy Gateway 1.7.1); set the root password via Rails; capture the runner registration token into OpenBao |
+| 9/9  | Install GitLab Runner (uses the registration token from OpenBao) |
 
 ## Smoke tests
 
@@ -77,23 +81,51 @@ kubectl get gateway,httproute -A
 # Expected: one Gateway (PROGRAMMED=True) + GitLab HTTPRoute
 # referencing it.
 
-# 3. Runner registered against GitLab.
+# 3. Stable PV/PVC pairs are bound to hostPath PVs (NOT
+# local-path-provisioner-minted ephemeral pvc-<UUID> names).
+# All five stateful services should show pv-<service> as the
+# volumeName (not pvc-<UUID>):
+kubectl -n gitlab get pvc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.volumeName}{"\n"}{end}'
+# Expected (one per line):
+#   gitlab-postgresql        pv-gitlab-postgresql
+#   gitlab-prometheus-server pv-gitlab-prometheus
+#   gitlab-redis             pv-gitlab-redis
+#   gitlab-minio             pv-gitlab-minio
+#   repo-data-gitlab-gitaly-0 pv-gitlab-gitaly
+# And openbao:
+kubectl -n openbao get pvc -o jsonpath='{.items[0].metadata.name}{"\t"}{.items[0].spec.volumeName}{"\n"}'
+# Expected: data-openbao-0   pv-openbao-data
+
+# 4. Runner registered against GitLab.
 kubectl -n gitlab exec deploy/gitlab-toolbox -- \
   bash -lc 'gitlab-rails runner "puts Ci::Runner.all.map { |r| %Q[#{r.description} (#{r.active})] }"'
 # Expected: a line per runner ending in "(true)".
 
-# 4. OpenBao has the GitLab initial password + runner token.
+# 5. OpenBao has the GitLab initial password + runner token.
 #    hvac auto-port-forwards 127.0.0.1:8200 — no kubectl exec needed.
 uv run blueprint-secrets read gitlab initial_root_password
 uv run blueprint-secrets read gitlab/runner registration_token
 
-# 5. GitLab UI is reachable via Envoy Gateway (port-forward if your
-#    kind node IPs aren't routable from this host — see URL table
-#    below for the canonical alternatives).
-kubectl -n gitlab port-forward svc/gitlab-webservice-default 18443:8181 &
-curl -ksf https://localhost:18443/-/health | jq .
+# 6. The chart-managed Secrets snapshot was written to the host.
+test -s infra/secrets/gitlab-runtime-secrets.yaml && \
+  echo "OK: snapshot exists ($(wc -l <infra/secrets/gitlab-runtime-secrets.yaml) lines)"
+# Expected: "OK: snapshot exists (N lines)" — empty file means the
+# snapshot step didn't run; check pipeline._step_persistent_secrets_snapshot.
 
-# 6. OpenBao UI is reachable.
+# 7. GitLab UI is reachable via Envoy Gateway. The bootstrap ships
+#    a `--port-forward` helper that bind-forwards 127.0.0.1:8443 →
+#    the chart-managed Envoy Service's `https-443` named port.
+uv run blueprint-bootstrap --port-forward gitlab &
+sleep 5
+# Important: the URL host drives the SNI hostname that picks the
+# right Gateway listener + cert. Use --resolve with curl so the SNI
+# matches (without it, Envoy returns `filter_chain_not_found` and
+# the TLS handshake dies with `unexpected eof while reading`).
+curl --resolve gitlab.local.bruj0.net:8443:127.0.0.1 -kfs \
+  https://gitlab.local.bruj0.net:8443/users/sign_in | head
+# Expected: HTML response with `<title>Sign in · GitLab</title>`.
+
+# 8. OpenBao UI is reachable.
 uv run blueprint-secrets ui    # prints the URL + root token, keeps the forward alive
 ```
 
@@ -138,14 +170,20 @@ When a step fails:
 
 1. **Read the failure** (`Phase 2 install failed: <error>`).
 2. **Map to the component** — each step has exactly one source file:
-   - Step 2 (CRDs)         → `phase2/gateway.py` (`GatewayCRDsInstaller`) or `references/gateway-api-crds/`
-   - Step 3 (OpenBao)      → `phase2/openbao.py` (chart install / init / unseal) or `phase2/secrets.py` (`OpenBaoClient`, hvac) or `references/helm-values-openbao.yaml`
-   - Step 4 (GitLab)       → `phase2/gitlab.py` or `references/helm-values-gitlab.yaml`
-   - Step 5 (Runner)       → `phase2/runner.py` or `references/helm-values-runner.yaml`
+   - Step 2 (CRDs)              → `phase2/gateway.py` (`GatewayCRDsInstaller`) or `references/gateway-api-crds/`
+   - Step 3 (local-path SC)     → `phase2/local_path_provisioner.py`
+   - Step 4 (stable PV/PVCs)    → `phase2/stable_storage.py` (`StableStorageInstaller`) + `StableVolume` entries + per-flavor PV YAML helpers
+   - Step 5 (OpenBao)           → `phase2/openbao.py` (chart install / init / unseal) or `phase2/secrets.py` (`OpenBaoClient`, hvac) or `references/helm-values-openbao.yaml`
+   - Step 6 (wildcard certs)    → `phase2/wildcard_certs.py` (`WildcardCertsInstaller`) + the 4 Gateway listener Secrets (`gitlab-wildcard-tls`, `registry-tls`, `kas-tls`, `minio-tls`)
+   - Step 7 (persistent restore)→ `phase2/persistent_secrets.py:restore()` + `infra/secrets/gitlab-runtime-secrets.yaml` (host-side snapshot)
+   - Step 8 (GitLab)            → `phase2/gitlab.py` or `references/helm-values-gitlab.yaml`
+   - Step 9 (Runner)            → `phase2/runner.py` or `references/helm-values-runner.yaml`
 3. **Re-run** `uv run blueprint-bootstrap --phase 2`. Every step
    has its own idempotency probe (e.g. OpenBao init only fires when
    `infra/secrets/openbao-init.json` is missing; `kv v2 enable` only
-   if the mount isn't present).
+   if the mount isn't present; wildcard certs are skipped if the
+   existing cert has ≥30 days validity; persistent-secrets restore
+   is a no-op if the snapshot file doesn't exist).
 4. **Append one line to "Common pitfalls" below** describing:
    `symptom → root cause → fix (file)` so the next run is one-shot.
 
@@ -235,21 +273,60 @@ edit the right file, and move on.
   `kubectl -n gitlab get httproute,svc` and confirm
   `gitlab-webservice-default` is `Ready`. Usually means the
   pre-install Job (root password) hasn't completed; wait and retry.
-
-## Rules of thumb (apply when adding Phase-2 charts)
-
-When you set a chart's `*Url`, `*Host`, or `*Endpoint` flag, ask
-**who is the caller?** — a developer's browser, or a pod inside the
-cluster? Use the rule:
-
-- Browser / host machine → `*.local.bruj0.net` (relies on `/etc/hosts`
-  on the developer's laptop; no service mesh, no TLS offloading).
-- Pod inside the cluster → in-cluster Service DNS: `svc-name.ns.svc:port`
-  (no DNS rewrites required; works on a fresh `kind` cluster).
-
-This applies to at least: GitLab Runner `gitlabUrl`, GitLab `sshHost`,
-the future GitLab Runner registration, anything chart-level that takes
-a hostname.
+- `Cannot bind to requested volume "pv-gitlab-minio":
+  storageClassName does not match` on the `gitlab-minio` PVC
+  → the chart mints the PVC with `storageClassName: local-path`,
+  but `phase2/stable_storage.py:StableVolume` for minio (Flavor C
+  `pvc_with_volume_name`) initially used `storageClassName:
+  manual`. K8s rejects binding even when `volumeName` is set
+  unless SC names match. Fix: the minio StableVolume must use
+  `storageClassName: local-path` (matching the chart's PVC SC).
+- `password authentication failed for user "gitlab"` in
+  PostgreSQL logs after `tofu destroy && tofu apply &&
+  bootstrap --phase 2` → the stable PV holds data written with
+  the *previous* install's chart-minted password, but the chart
+  minted fresh random passwords on the next install. The
+  `persistent_secrets.py:restore()` step (run BEFORE the chart
+  install) re-applies the previous chart-managed Secrets so the
+  chart sees them already exist and reuses them. If the snapshot
+  file is stale (e.g. captured from a previous `--destroy` cycle
+  that didn't actually wipe data), wipe it via
+  `bootstrap --destroy --yes` (see "How to undo" below).
+- `filter_chain_not_found` from Envoy in the proxy access log
+  + `unexpected eof while reading` on curl TLS → the URL host
+  doesn't drive the SNI hostname that Envoy expects. The Gateway
+  has 4 listeners, one per hostname (`gitlab.local.bruj0.net`,
+  `registry.local.bruj0.net`, `kas.local.bruj0.net`,
+  `minio.local.bruj0.net`); without SNI matching the listener,
+  Envoy returns no filter chain and closes the TLS connection.
+  Fix for curl: `--resolve <host>:8443:127.0.0.1
+  https://<host>:8443/...`. For browsers: visit
+  `https://gitlab.local.bruj0.net:8443/users/sign_in` (the URL
+  host is the SNI).
+- `Permission denied: '/...infra/data/shared/stable/openbao/data/core'`
+  during `bootstrap --destroy` → PV dirs are owned by the pod's
+  runtime UID (openbao=100, postgres=1001) and the unprivileged
+  `rm` can't traverse mode-0700 subdirs. The destroy falls back
+  to `find ... -exec chmod 777` first, and if that still fails,
+  to `docker run --rm -v <parent>:/mnt alpine sh -c
+  'chmod -R a+rwX /mnt && rm -rf /mnt/<target>'` (Podman also
+  tried). If neither runtime is available, the error message
+  prints the exact `sudo rm -rf` command for the user to run
+  manually.
+- The chart's pre-install cfssl Job is **skipped** when
+  `global.gatewayApi.enabled=true` (because
+  `gitlab.ingress.tls.configured` returns `"true"` under Gateway
+  API). Symptom: Gateway listener reports
+  `InvalidCertificateRef` because the listener's
+  `tls.certificateRefs[0].name` defaults to `gitlab-tls` (the
+  cert-manager-style name) but no Secret by that name was ever
+  minted. Fix: the bootstrap's `phase2/wildcard_certs.py`
+  mints the CA + cert before the chart install and materialises
+  the 4 Secrets (`gitlab-wildcard-tls`, `registry-tls`,
+  `kas-tls`, `minio-tls`), and the values override flips
+  `global.ingress.tls.secretName: gitlab-wildcard-tls`. If you
+  find the chart's pre-install cfssl Job didn't run, don't
+  enable it manually — the bootstrap handles it.
 
 ## Rules of thumb (apply when adding Phase-2 charts)
 
@@ -275,27 +352,56 @@ one-shot.
 
 ## How to undo
 
+The bootstrap ships a one-shot teardown that wipes the **whole**
+Phase-2 state — cluster, host-side data, secrets, and TLS
+material:
+
 ```sh
-# Drop every Phase-2 chart release (OpenBao init JSON stays on disk
-# until the next step, so you can recover unseal keys if you want).
+uv run blueprint-bootstrap --destroy [--yes] [--dry-run]
+```
+
+Concretely the command runs:
+
+1. `tofu destroy` — drops the kind cluster, the kubeconfig file,
+   and the smoke-test file. **This is the only step that
+   touches the cluster;** it never recreates. Per
+   `AGENTS.md § 4 rule #1`, the user must run `tofu apply`
+   themselves.
+2. Recursive removal of bootstrap-owned host-side state:
+   - `infra/data/shared/stable/<service>/` — preserved PV data
+     (PostgreSQL, Redis, Prometheus, Gitaly, MinIO, OpenBao).
+   - `infra/data/shared/*.preserved-*` — orphaned local-path
+     provisioner dirs from past `helm uninstall`s.
+   - `infra/tls/wildcard/` — the self-signed CA + cert.
+   - `infra/secrets/openbao-init.json` — root token + unseal key.
+   - `infra/secrets/gitlab-runtime-secrets.yaml` — chart-managed
+     Secrets snapshot.
+3. For PV dirs owned by a pod UID (openbao=100, postgres=1001)
+   that the unprivileged `rm` can't traverse, the destroy
+   chmod's the tree to `0777` first; if that still fails
+   (because inner dirs are also mode `0700`), it falls back to
+   `docker run --rm -v <parent>:/mnt alpine sh -c
+   'chmod -R a+rwX /mnt && rm -rf /mnt/<target>'` (Podman also
+   tried). If neither runtime is available, the error message
+   prints the exact `sudo rm -rf` for the user to run manually.
+
+`--dry-run` prints what would be removed without removing.
+`--yes` skips the interactive confirmation. After `--destroy`,
+the next `tofu apply && uv run blueprint-bootstrap --phase 2`
+is a true clean-slate install.
+
+If you only want to drop the chart releases but keep the cluster
+up (e.g. for debugging the chart), the legacy manual teardown
+still works:
+
+```sh
 helm uninstall -n openbao      openbao
 helm uninstall -n gitlab       gitlab
 helm uninstall -n gitlab-runner gitlab-runner
-
-# Wipe the Gateway API CRDs (upstream standard + the 2 chart-shipped
-# Envoy CRDs the GitLab chart needs). Safe to omit if other charts
-# on the cluster also use them.
-kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
-kubectl delete -f infra/scripts/bootstrap/phase2/references/gateway-api-crds/
-
-# Wipe the namespaces.
 kubectl delete namespace openbao gitlab gitlab-runner 2>/dev/null
-
-# Drop the secret-bootstrap state.
-rm -rf infra/secrets/
-
-# Phase 1 cluster stays up.
 ```
 
-After undo, a fresh `uv run blueprint-bootstrap --phase 2`
-re-installs everything.
+But note: the stable PVs under `infra/data/shared/stable/`
+**survive** this manual teardown (that's the point), and the
+next `bootstrap --phase 2` will reuse them. Only `--destroy`
+wipes them in lock-step with the secrets snapshot.

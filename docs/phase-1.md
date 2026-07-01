@@ -10,11 +10,13 @@ isolation before moving on.
 - 1 control-plane node (`control-plane-1`, 4 GB)
 - 3 worker nodes for GitLab services (`gitlab-1..3`, 4 GB each)
 - 1 worker node for the GitLab Runner (`runner`, 8 GB)
-- Per-node `extraMounts` from `infra/data/nodeN` → `/var/local/nodeN`
-  (the `data_root` variable in `infra/tofu/tofu.tfvars.example`
-  defaults to `../data`, which resolves to `infra/data/`)
-- Shared `extraMounts` from `infra/data/shared` → `/var/local/shared`
-  on every node (incl. control-plane)
+- One **shared** hostPath bind from `infra/data/shared` →
+  `/var/local/shared` on **every** node (incl. control-plane).
+  The Phase 2 bootstrap wires a `local-path` StorageClass on top
+  (`pathBase = /var/local/shared`), and chart-managed PVCs each
+  create their sub-directory there. The whole tree survives
+  `tofu destroy && tofu apply` — that's where GitLab stores
+  Postgres, Gitaly, MinIO, Registry, Redis, … data.
 - Host ports `80` and `443` on the control-plane reserved for the
   Phase 2 Envoy Gateway entrypoint (forwarded to the cluster by kind).
 - **TLS is NOT part of Phase 1** anymore — the GitLab chart's pre-install
@@ -111,10 +113,11 @@ tofu -chdir=blueprint/infra/tofu destroy -auto-approve
 ```
 
 `infra/data/*` is on the host so it survives cluster destroy. Delete it
-manually if you want a clean slate:
+manually if you want a clean slate (also wipes PVC data; you don't want
+this unless you're intentionally resetting GitLab state):
 
 ```sh
-rm -rf infra/data/node{1,2,3,4}/* infra/data/shared/*
+sudo rm -rf infra/data/shared/*
 ```
 
 (The real hostPath source is `infra/data/`, configured by the
