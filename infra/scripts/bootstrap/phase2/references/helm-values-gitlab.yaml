@@ -235,30 +235,17 @@ registry:
 # chart instead mints `gitlab-wildcard-tls` (and `-ca`) via
 # cfssl-self-sign. The Gateway listener needs to match.
 #
-# --- NodePort data-plane exposure ---
+# --- Data-plane Service (NodePort) + post-install patch ---
 # Chart 10.x's gatewayApiResources.envoy.proxySpec default sets
 # the data-plane Service type to LoadBalancer, expecting a
 # provisioner (MetalLB, cloud-provider-kind, …) to allocate IPs.
-# kind has no such provisioner, so the data-plane Service never
-# becomes ready, the Gateway condition reports `AddressNotUsable`,
-# and listeners stay Accepted=False.
-#
-# Switch the data-plane Service to NodePort and pin nodePort
-# values to match the kind extraPortMappings in
-# infra/tofu/cluster.tf:
-#   host:80    → kind cp container:30080 → data-plane svc port 80
-#   host:443   → kind cp container:30443 → data-plane svc port 443
-#   host:22    → kind cp container:30022 → data-plane svc port 22
-#
-# Pinning nodePort via the listener spec does NOT actually pin the
-# data-plane Service's NodePort — the Gateway API spec has no
-# `nodePort` field on listeners, and the EnvoyProxy CR
-# (`gateway.envoyproxy.io/v1alpha1`) has no per-port nodePort field
-# either. The operator always picks random NodePorts in the cluster's
-# 30000-32767 range. We keep the `nodePort: 30443` etc. annotations
-# in each listener for documentation only, and the bootstrap's
-# `GitlabInstaller._patch_gateway_data_plane` re-pins the
-# data-plane Service's NodePorts via `kubectl patch` after install.
+# kind has no such provisioner, so we set type=NodePort below and
+# let the bootstrap's `GitlabInstaller._patch_gateway_data_plane`
+# re-pin the operator-picked NodePorts to fixed values (30080/30443/
+# 30022). The data-plane is reachable from the host only via the
+# bootstrap CLI's `kubectl port-forward` (binds 127.0.0.1:8443/8222
+# to the Service's ClusterIP); kind does not publish NodePorts to
+# the host.
 #
 # Also: `gatewayApiResources.gateway.addresses` is explicitly set to
 # an empty list. The chart's `templates/gateway.yaml` would otherwise

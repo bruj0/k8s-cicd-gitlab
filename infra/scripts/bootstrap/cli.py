@@ -89,10 +89,37 @@ from .app import BootstrapApp
     help=(
         "Forward a local port to a cluster service (e.g. 'gitlab' "
         "forwards 127.0.0.1:8443 → chart-managed Envoy Gateway "
-        ":443). Blocks until interrupted. The kind cluster does not "
+        ":443). Forks to the background by default (PID written to "
+        "infra/secrets/port-forward-<target>.pid, log to "
+        "infra/logs/port-forward-<target>.log). Use --foreground to "
+        "block until Ctrl+C instead. The kind cluster does not "
         "expose 80/443 externally (no LoadBalancer IPs in kind), "
         "so this is how the browser reaches GitLab at "
         "https://gitlab.local.bruj0.net:8443."
+    ),
+)
+@click.option(
+    "--port",
+    "port_forward_local_port",
+    default=8443,
+    type=int,
+    show_default=True,
+    help=(
+        "Local host port to bind the --port-forward to. Default 8443 "
+        "(not 443, which needs root and is reserved for other "
+        "system services)."
+    ),
+)
+@click.option(
+    "--foreground",
+    "port_forward_foreground",
+    is_flag=True,
+    help=(
+        "Block in the foreground instead of forking to the "
+        "background. Equivalent to running `kubectl port-forward` "
+        "directly. The default background mode writes a PID file "
+        "and exits immediately so the bootstrap CLI can be used "
+        "as a one-shot setup step (e.g. from `nohup ... &`)."
     ),
 )
 @click.option(
@@ -153,6 +180,8 @@ def main(
     dry_run: bool,
     user: bool,
     port_forward_target: str | None,
+    port_forward_local_port: int,
+    port_forward_foreground: bool,
     destroy: bool,
     preserve_data: bool,
     confirm_yes: bool,
@@ -166,8 +195,13 @@ def main(
     # wrapper is a thin shim.
     if port_forward_target is not None:
         # Short-circuit: skip the bootstrap entirely and just keep
-        # the port-forward alive in the foreground.
-        return _run_port_forward(port_forward_target)
+        # the port-forward alive (foreground) or fork it to the
+        # background and exit (default).
+        return _run_port_forward(
+            port_forward_target,
+            port_forward_local_port,
+            port_forward_foreground,
+        )
     argv: list[str] = []
     if phase != 1:
         argv += ["--phase", str(phase)]
@@ -189,25 +223,26 @@ def main(
     return app.run()
 
 
-def _run_port_forward(target: str) -> int:
-    """Block forever, forwarding a host port to a cluster service.
+def _run_port_forward(target: str, local_port: int, foreground: bool) -> int:
+    """Forward a host port to a cluster service.
 
     Supported targets (the only one the blueprint currently needs is
     `gitlab`):
-        gitlab   127.0.0.1:8443 → svc/envoy-<gateway>-<hash> :https-443
+        gitlab   127.0.0.1:<port> → svc/envoy-<gateway>-<hash> :https-443
                  on the chart-managed Envoy Gateway that fronts
-                 GitLab webservice + registry + kas + minio. We use
-                 host port 8443 (not 443) because kind's
-                 `extraPortMappings` already reserves 443 on the
-                 control-plane container for future use; binding
-                 443 from a port-forward would conflict.
+                 GitLab webservice + registry + kas + minio.
+
+                 The local port defaults to 8443 (not 443, which is
+                 a privileged port and would also conflict with
+                 other system services). Override with `--port 443`
+                 if you want the standard HTTPS port (requires root).
 
                  We forward to the gateway Service's named port
                  `https-443` (whose targetPort is 10443, the port
                  the Envoy proxy actually binds on). Forwarding
-                 to port 443 would not resolve because the
-                 Service has no service port 443 — only the named
-                 port `https-443` whose port field is 443.
+                 to the numeric 443 would not resolve because the
+                 Service has no service port 443 — only a named
+                 port `https-443` whose `port:` field is 443.
 
                  IMPORTANT: the Gateway has multiple listeners,
                  one per hostname (gitlab.local.bruj0.net,
@@ -217,8 +252,23 @@ def _run_port_forward(target: str) -> int:
                  must send SNI. For browsers that just means
                  visiting `https://gitlab.local.bruj0.net:8443/...`
                  (the SNI hostname is derived from the URL host).
-                 For `curl`, you need `--resolve <host>:8443:127.0.0.1`
+                 For `curl`, you need
+                 `--resolve gitlab.local.bruj0.net:8443:127.0.0.1`
                  so the SNI matches the listener hostname.
+
+    Modes:
+        default (background) — double-fork to detach from the
+                 terminal, write the PID to
+                 `infra/secrets/port-forward-<target>.pid` and the
+                 combined stdout/stderr to
+                 `infra/logs/port-forward-<target>.log`, then
+                 exit 0. The caller can `kill $(cat ...pid)` to
+                 stop the forward, or re-run with `--foreground`
+                 to run it attached.
+        --foreground — block in the foreground (Ctrl+C stops the
+                 forward) for users who want to see the
+                 `Forwarding from 127.0.0.1:...` banner and stop
+                 it interactively.
 
     For everything else (OpenBao UI, k9s) the existing
     `bootstrap.secrets_cli ui` and `k9s` commands do the right
@@ -228,9 +278,20 @@ def _run_port_forward(target: str) -> int:
     import os
     import signal
     import subprocess
+    from pathlib import Path
+
+    # Resolve bootstrap dir so PID + log paths land in infra/{secrets,logs}.
+    bootstrap_dir = Path(__file__).resolve().parent
+    repo_root = bootstrap_dir.parent.parent  # scripts/bootstrap → infra → repo
+    # The infra/ root can sit one level under the repo (e.g. /…/blueprint/infra)
+    # — we keep both layouts working.
+    infra_root = repo_root / "infra" if (repo_root / "infra").exists() else repo_root
+    pid_path = infra_root / "secrets" / f"port-forward-{target}.pid"
+    log_path = infra_root / "logs" / f"port-forward-{target}.log"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     if target == "gitlab":
-        local_port = 8443
         # Discover the Envoy Gateway Service — the chart picks a
         # hash suffix that changes on every install/upgrade, so
         # we must look it up rather than hard-code it.
@@ -261,14 +322,13 @@ def _run_port_forward(target: str) -> int:
             f"svc/{svc}",
             f"{local_port}:https-443",
         ]
-        print(
+        announce = (
             f"Forwarding 127.0.0.1:{local_port} → {svc}.gitlab.svc:https-443\n"
             f"Visit: https://gitlab.local.bruj0.net:{local_port}/\n"
             f"  (the URL host drives the SNI hostname that picks the\n"
             f"   right Gateway listener + cert.)\n"
             f"For curl: curl -k --resolve gitlab.local.bruj0.net:{local_port}:127.0.0.1 \\\n"
-            f"          https://gitlab.local.bruj0.net:{local_port}/users/sign_in\n"
-            f"(Press Ctrl+C to stop.)\n"
+            f"          https://gitlab.local.bruj0.net:{local_port}/users/sign_in"
         )
     else:
         print(
@@ -278,12 +338,71 @@ def _run_port_forward(target: str) -> int:
         )
         return 2
 
-    # Replace this process with `kubectl port-forward` so Ctrl+C
-    # cleanly stops the forward (instead of the parent shell).
-    try:
-        os.execvp(cmd[0], cmd)
-    except KeyboardInterrupt:
-        return 0
+    if foreground:
+        # Replace this process with `kubectl port-forward` so Ctrl+C
+        # cleanly stops the forward (instead of the parent shell).
+        print(announce + "\n(Press Ctrl+C to stop.)\n")
+        try:
+            os.execvp(cmd[0], cmd)
+        except KeyboardInterrupt:
+            return 0
+
+    # Background mode. If a previous forward is still running,
+    # report its PID and exit non-zero so the caller can decide
+    # whether to kill+restart or leave it alone.
+    if pid_path.exists():
+        try:
+            old_pid = int(pid_path.read_text().strip())
+            os.kill(old_pid, 0)  # raises if not alive
+            print(
+                f"ERROR: --port-forward {target!r} is already "
+                f"running (PID {old_pid}). Stop it with:\n"
+                f"  kill $(cat {pid_path})\n"
+                f"or just delete the PID file and re-run.",
+                file=sys.stderr,
+            )
+            return 1
+        except (ProcessLookupError, ValueError):
+            # Stale PID file. Drop it and continue.
+            pid_path.unlink(missing_ok=True)
+
+    # Double-fork to fully detach from the controlling terminal.
+    # First fork: parent exits, child becomes session leader.
+    if os.fork() != 0:
+        # Give the child a beat to write its PID + log, then exit.
+        import time
+        for _ in range(20):
+            time.sleep(0.1)
+            if pid_path.exists():
+                break
+        if pid_path.exists():
+            pid = pid_path.read_text().strip()
+            print(announce)
+            print(
+                f"\nBackground PID: {pid}\n"
+                f"  log: {log_path}\n"
+                f"  stop: kill $(cat {pid_path})"
+            )
+            return 0
+        print(
+            "ERROR: forked port-forward child did not write a "
+            f"PID file within 2s. Check {log_path}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Child: detach from terminal.
+    os.setsid()
+    # Redirect stdio to the log file.
+    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+    os.close(log_fd)
+    # Write our PID as soon as possible (parent is waiting on it).
+    pid_path.write_text(f"{os.getpid()}\n")
+    # Replace this process with kubectl port-forward. From here
+    # we never return.
+    os.execvp(cmd[0], cmd)
 
 
 def _run_destroy(confirm_yes: bool, dry_run: bool, preserve_data: bool = False) -> int:
