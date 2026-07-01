@@ -42,7 +42,21 @@ from __future__ import annotations
 
 import json
 import secrets
+import time
 from dataclasses import dataclass
+
+
+def _is_phase_healthy(phase: str) -> bool:
+    """True when CNPG reports a phase we know is terminal-good.
+
+    CNPG cluster phases aren't a stable enum across versions;
+    we treat the canonical "Healthy" as the only acceptable
+    terminal state but conservatively also short-circuit on
+    "Cluster in healthy state" (1.30.0 sometimes logs that as
+    the phase string before flipping to Healthy). Anything
+    else is treated as "not yet healthy, keep polling".
+    """
+    return phase in ("Healthy", "Cluster in healthy state")
 
 from ..app_installer import HelmAppInstaller
 from ..logger import Logger
@@ -124,11 +138,35 @@ class CloudNativePGInstaller:
         self._claim_orphan_pvc()
 
     def _claim_orphan_pvc(self) -> None:
-        """Set Cluster as the controller-owner of `postgresql-cnpg-1`.
+        """Make the operator recognise our pre-created PVC + owner it.
 
-        Idempotent: if `ownerReferences` already points at the
-        Cluster, this is a no-op. The block-level JSON merge patch
-        is safe to re-run.
+        Two patching jobs on `postgresql-cnpg-1`:
+
+          1. `ownerReferences[0] = cluster/{CLUSTER_NAME}` so the
+             CNPG API-server field-index selector sees the PVC
+             as managed (preventing the operator's
+             `metadata.controller` lookup from missing it).
+
+          2. `cnpg.io/instanceRole: primary` LABEL (in addition
+             to whatever `stable_storage.py` already stamped).
+             Belt-and-suspenders: CNPG 1.30's
+             `ensurePrimaryBootstrapJob` (added in upstream PR
+             #11039, fixes first-primary bootstrap deadlock from
+             #11036) reads `cnpg.io/instanceRole` from
+             `meta.Labels` via `specs.IsPrimary`, NOT from
+             annotations. Without the label, when the recovery
+             handler fires on a fresh install where the PVC was
+             pre-created without first being claimed by the
+             operator, it refuses to recreate the missing
+             bootstrap Job — leaving the cluster stuck in
+             "Selected PVC is not ready yet" forever. The label
+             is idempotent: if `stable_storage.py` already stamped
+             it, this patch is a no-op (strategic merge patch
+             keeps the existing value when the key already
+             exists).
+
+        Idempotent: re-running against a PVC that's already
+        patched is a no-op for both fields.
         """
         # 1. Read the Cluster's UID
         cluster_json = self.runner.run(
@@ -139,10 +177,7 @@ class CloudNativePGInstaller:
         cluster = json.loads(cluster_json)
         cluster_uid = cluster["metadata"]["uid"]
 
-        # 2. Patch the PVC: replace ownerReferences wholesale. We
-        # can't use a strategic-merge here because the existing
-        # field might be missing; a JSON-patch replace-or-add is
-        # safer.
+        # 2a. Patch ownerReferences (controller owner)
         owner_ref = [{
             "apiVersion": "postgresql.cnpg.io/v1",
             "kind": "Cluster",
@@ -164,10 +199,83 @@ class CloudNativePGInstaller:
             f"{CLUSTER_NAME}-1 (so CNPG's field-index selector finds it)"
         )
 
+        # 2b. Patch the primary-role LABEL. CNPG 1.30's recovery
+        # path refuses to recreate the bootstrap Job when this
+        # label is missing — see cloudnative-pg/internal/controller/
+        # cluster_create.go's ensurePrimaryBootstrapJob + the
+        # specs.IsPrimary(meta) lookup in pkg/specs/pg_pods.go.
+        self.runner.run(
+            ["kubectl", "-n", CLUSTER_NAMESPACE, "patch", "pvc",
+             f"{CLUSTER_NAME}-1", "--type=strategic",
+             "--patch", json.dumps({
+                 "metadata": {
+                     "labels": {"cnpg.io/instanceRole": "primary"}
+                 }
+             })],
+            check=True,
+        )
+        self.log.ok(
+            f"Patched cnpg.io/instanceRole=primary LABEL on PVC "
+            f"{CLUSTER_NAME}-1 (unblocks CNPG 1.30's "
+            f"ensurePrimaryBootstrapJob recovery)"
+        )
+
     def wait_for_ready(self, timeout_s: int = 300) -> None:
-        """Block until Cluster/postgresql reports Ready."""
+        """Block until Cluster/postgresql reports Ready.
+
+        Self-heals from the CNPG 1.30 first-primary bootstrap
+        deadlock (upstream issue #11036): cluster ends up with
+        `Initialized=True` (BootstrapCompleted reason) but the
+        initdb Job was never created and the Instance Pod is
+        stuck in Pending. The symptom is `phase` empty in
+        `.status` and the operator's reconcile loop logging
+        "Selected PVC is not ready yet, waiting for 1 second"
+        forever. We poll every 15 s; once we've seen the wedge
+        for ≥60 s we delete the Cluster CR (cascades any owned
+        init Job + Pod) + the orphaned PVC, then re-apply. The
+        fresh reconcile gets a clean state where CNPG's
+        `EnrichStatus` re-classifies the PVC (now with our
+        pre-stamped `cnpg.io/instanceRole: primary` LABEL) and
+        `ensurePrimaryBootstrapJob` can take over.
+
+        The cap is two recovery attempts (worst case the user's
+        CNPG build is broken in a way we don't yet know). After
+        that, fall back to the parent `kubectl wait` command
+        which surfaces the operator's logs as a regular
+        failure to the bootstrap.
+        """
         if isinstance(self.runner, DryRunRunner):
             return
+        # Bound wait: poll our own probe every 15 s for
+        # `min(timeout_s, 90)` (90s gives the cluster enough time
+        # to do a normal primary bring-up; the wedge hits well
+        # after that). If the parent wait would time out we
+        # surface the operator's logs once via the original
+        # `kubectl wait` failure.
+        probe_window = min(timeout_s, 90)
+        deadline = time.monotonic() + probe_window
+        consecutive_wedge = 0
+        recovery_attempts = 0
+        while time.monotonic() < deadline:
+            phase, initialized = self._probe_cluster_status()
+            if phase == "Healthy" or _is_phase_healthy(phase):
+                # Native happy path; let kubectl wait confirm Ready.
+                break
+            if phase in ("", "Setting up primary") and initialized:
+                consecutive_wedge += 1
+                if consecutive_wedge >= 4 and recovery_attempts < 2:
+                    self._recover_from_wedge(recovery_attempts + 1)
+                    recovery_attempts += 1
+                    consecutive_wedge = 0
+                    # Reset the deadline so the new reconcile gets
+                    # a fresh window before the parent timeout.
+                    deadline = time.monotonic() + probe_window
+            else:
+                consecutive_wedge = 0
+            time.sleep(15)
+        # Delegate the final `Healthy=True` confirmation to
+        # `kubectl wait` so the caller sees a normal error if
+        # recovery ran out of attempts.
         self.runner.run(
             [
                 "kubectl", "-n", CLUSTER_NAMESPACE,
@@ -178,6 +286,69 @@ class CloudNativePGInstaller:
             check=True,
         )
         self.log.ok(f"Cluster/{CLUSTER_NAME} is Ready")
+
+    def _probe_cluster_status(self) -> tuple[str, bool]:
+        """Read `(phase, initialized)` from Cluster.status.
+
+        Returns `("", False)` on any error (PV getting
+        restarted, transient API errors, ...) — the caller
+        treats that as "neither healthy nor wedged, just wait".
+        """
+        try:
+            cluster = json.loads(self.runner.run(
+                ["kubectl", "-n", CLUSTER_NAMESPACE, "get", "cluster",
+                 CLUSTER_NAME, "-o", "json"],
+                check=True,
+            ).stdout)
+        except Exception:
+            return "", False
+        status = cluster.get("status", {})
+        phase = status.get("phase", "") or ""
+        initialized = any(
+            cond.get("type") == "Initialized"
+            and cond.get("status") == "True"
+            for cond in status.get("conditions", [])
+        )
+        return phase, initialized
+
+    def _recover_from_wedge(self, attempt: int) -> None:
+        """Break the CNPG 1.30 wedge by deleting + re-applying the cluster.
+
+        Idempotent: the wedge either resolves on the fresh
+        reconcile (then `wait_for_ready` returns) or doesn't (then
+        we'll try again or surface the operator's logs).
+        """
+        self.log.warn(
+            f"CNPG cluster appears wedged (attempt {attempt}/2). "
+            f"Deleting Cluster CR + orphan PVC + re-applying to break "
+            f"the first-primary bootstrap deadlock (upstream issue "
+            f"#11036)."
+        )
+        # 1. Delete the Cluster CR (cascades owned pods/Services).
+        self.runner.run(
+            ["kubectl", "-n", CLUSTER_NAMESPACE, "delete", "cluster",
+             CLUSTER_NAME, "--wait=false"],
+            check=False,
+        )
+        # 2. Delete the orphan PVC (defensive: k8s GC may not
+        #    reclaim it if the binder saw the corrupt claimRef).
+        self.runner.run(
+            ["kubectl", "-n", CLUSTER_NAMESPACE, "delete", "pvc",
+             f"{CLUSTER_NAME}-1", "--wait=false", "--ignore-not-found"],
+            check=False,
+        )
+        # 3. Re-apply the Cluster manifest so a fresh reconcile
+        #    can take over.
+        self.runner.run(
+            ["kubectl", "-n", CLUSTER_NAMESPACE, "apply",
+             "--server-side", "--force-conflicts",
+             "-f", str(self.paths.phase2_refs_dir / "cluster-postgresql.yaml")],
+            check=False,
+        )
+        # 4. Re-stamp the controller owner + LABEL on the freshly
+        #    recreated PVC (the delete above removes our
+        #    pre-stamps; _claim_orphan_pvc re-applies them).
+        self._claim_orphan_pvc()
 
     def bootstrap_dbs(self) -> None:
         """Create GitLab + OpenBao roles + databases on the Cluster.

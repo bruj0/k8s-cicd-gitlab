@@ -120,11 +120,30 @@ class StableVolume:
     # Annotations to stamp on the pre-created PVC (Flavor A only).
     # Required for CNPG: the operator's `EnrichStatus` only counts
     # PVCs whose `cnpg.io/nodeSerial` annotation parses to an int
-    # AND whose name matches `<cluster>-<serial>`. Without these,
-    # `cluster.Status.Instances` stays at 0 and the operator loops
-    # in `createPrimaryInstance` → "refusing to create the primary
-    # instance because the cluster already initialized".
+    # AND whose name matches `<cluster>-<serial>`. Without the
+    # annotation, `cluster.Status.Instances` stays at 0 and the
+    # operator loops in `createPrimaryInstance` → "refusing to
+    # create the primary instance because the cluster already
+    # initialized".
     pvc_annotations: dict[str, str] = field(default_factory=dict)
+    # Labels to stamp on the pre-created PVC (Flavor A only).
+    # REQUIRED for CNPG 1.30+ on the data PVC: the operator's
+    # `ensurePrimaryBootstrapJob` recovery handler (added in
+    # cloudnative-pg PR #11039 to fix first-primary bootstrap
+    # deadlock, see upstream issue #11036) reads the
+    # `cnpg.io/instanceRole` *LABEL* via `specs.IsPrimary()`,
+    # not the annotation. On a fresh install where the bootstrap
+    # pre-creates the PVC + chart-bundled operator first sees the
+    # cluster, the PVC's `cnpg.io/pvcStatus` is unset and the
+    # operator gets stuck in its "Selected PVC is not ready yet"
+    # reconcile loop forever (the recovery handler refuses to
+    # re-create the missing bootstrap Job because the PVC doesn't
+    # look primary). Stamping the label here short-circuits that:
+    # the recovery handler sees `role=primary` and re-creates the
+    # initdb Job using the existing PVC. Stamping both label AND
+    # annotation is safe — the operator then patches both to its
+    # canonical values, overriding ours.
+    pvc_labels: dict[str, str] = field(default_factory=dict)
 
     @property
     def host_path(self) -> str:
@@ -172,8 +191,18 @@ STABLE_VOLUMES: tuple[StableVolume, ...] = (
     # `cluster.Status.Instances = 0`, which sends the operator
     # into a reconcile loop calling `createPrimaryInstance` →
     # "refusing to create the primary instance because the
-    # cluster already initialized" + "PhaseUnrecoverable" on
-    # every cycle (~10/s).
+    # cluster already initialized".
+    #
+    # IMPORTANT (CNPG 1.30+): `pvc_labels` (not annotations)
+    # carries `cnpg.io/instanceRole: primary`. The operator's
+    # `ensurePrimaryBootstrapJob` recovery (PR #11039, fixes the
+    # first-primary bootstrap deadlock from upstream issue #11036)
+    # reads `cnpg.io/instanceRole` from labels via
+    # `specs.IsPrimary(meta)`. Without the LABEL, the recovery
+    # won't fire on a wedged cluster and the bootstrap stalls in
+    # "Selected PVC is not ready yet" forever. Set as a label
+    # here; the operator will re-stamp both label + annotation to
+    # its canonical values after claiming the PVC.
     StableVolume(
         "existing_claim", "postgresql", "cnpg", "postgresql/cnpg", "8Gi",
         pv_name="pv-cnpg-data",
@@ -183,17 +212,28 @@ STABLE_VOLUMES: tuple[StableVolume, ...] = (
         # https://cloudnative-pg.io/documentation/1.30/cloudnative-pg.v1/#postgresql-api
         chart_value_path="",
         chart_value="",
-        # Stamp the CNPG labels + nodeSerial annotation on our
-        # pre-created PVC so the operator's `EnrichStatus` recognises
-        # it as belonging to instance 1 of `postgresql-cnpg`. Without
-        # these, the PVC is filtered out → `Status.Instances = 0` →
-        # reconcile loop.
+        # Annotations: nodeSerial is required (parsed by
+        # `EnrichStatus` via `specs.GetNodeSerial(meta)`). cluster
+        # + instanceName are belt-and-suspenders.
         pvc_annotations={
             "cnpg.io/cluster": "postgresql-cnpg",
             "cnpg.io/instanceName": "postgresql-cnpg-1",
-            "cnpg.io/instanceRole": "primary",
             "cnpg.io/nodeSerial": "1",
             "cnpg.io/pvcRole": "PG_DATA",
+        },
+        # Labels: instanceRole is what `ensurePrimaryBootstrapJob`
+        # reads (set as a label, NOT annotation — see upstream
+        # `pkg/specs/pg_pods.go:IsPrimary` which inspects
+        # `meta.Labels`, not `meta.Annotations`). Without this
+        # label, the recovery handler refuses to re-create the
+        # bootstrap Job and the cluster wedged on a fresh
+        # install in the 1.30.0 cut (see git log for
+        # `cloudnative-pg/internal/controller/cluster_create.go`'s
+        # changelog).
+        pvc_labels={
+            "cnpg.io/cluster": "postgresql-cnpg",
+            "cnpg.io/instanceName": "postgresql-cnpg-1",
+            "cnpg.io/instanceRole": "primary",
         },
     ),
     # External Redis data — chart 10.x consumes Redis externally
@@ -363,17 +403,30 @@ spec:
             annotations_yaml = "  annotations:\n" + "".join(
                 f"    {k}: {v!r}\n" for k, v in vol.pvc_annotations.items()
             )
+        # Labels: caller's `pvc_labels` go FIRST so the
+        # well-known ownership labels (managed-by / component /
+        # stable-volume) come last and are easy to spot on
+        # `kubectl describe`. Stamping the caller's labels first
+        # also means we don't accidentally let caller values
+        # shadow our ownership bookkeeping (which the
+        # installer's iteration loops rely on).
+        labels_yaml = "  labels:\n"
+        if vol.pvc_labels:
+            labels_yaml += "".join(
+                f"    {k}: {v!r}\n" for k, v in vol.pvc_labels.items()
+            )
+        labels_yaml += (
+            "    app.kubernetes.io/managed-by: blueprint-stable-storage\n"
+            f"    app.kubernetes.io/component: {vol.component}\n"
+            f'    blueprint/stable-volume: "{vol.component}"\n'
+        )
         return f"""\
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {vol.pvc_name}
   namespace: {vol.namespace}
-{annotations_yaml}  labels:
-    app.kubernetes.io/managed-by: blueprint-stable-storage
-    app.kubernetes.io/component: {vol.component}
-    blueprint/stable-volume: "{vol.component}"
-spec:
+{annotations_yaml}{labels_yaml}spec:
   accessModes:
     - ReadWriteOnce
   resources:
@@ -521,16 +574,27 @@ spec:
         # from the OLD PVC's UID (if a PVC with the same name+ns
         # already existed in another cluster recreate cycle). That
         # stale uid blocks the new StatefulSet from claiming us,
-        # leaving the PVC in `Lost` state forever. We patch
-        # claimRef.uid to null after apply so the new PVC (with
-        # fresh uid) can claim us.
+        # leaving the PVC in `Lost` state forever (the kube-
+        # apiserver's binding-controller treats any `claimRef`
+        # whose `uid` doesn't match a live PVC as "already bound
+        # to a different claim" and refuses new bindings). We
+        # detect this defensively and remove the entire claimRef
+        # so the new PVC (with its fresh uid) can claim us on
+        # first schedule.
+        #
+        # We intentionally do NOT use `replace /spec/claimRef/uid`
+        # with `null` anymore — that path silently corrupted
+        # claimRef into an invalid partial object that the
+        # binding-controller rejected with "volume already bound
+        # to a different claim" (see git history; symptom is the
+        # cluster wedging in `Setting up primary` with the PVC
+        # stuck Pending). Removal is the only safe reset.
         if kind == "pv":
             self._r.run(
                 [
                     "kubectl", "patch", "pv", name,
                     "--type=json",
-                    "-p",
-                    '[{"op": "replace", "path": "/spec/claimRef/uid", "value": null}]',
+                    "-p", '[{"op": "remove", "path": "/spec/claimRef"}]',
                 ],
                 check=False,
             )
