@@ -56,3 +56,11 @@ __pycache__/
 .DS_Store
 *.swp
 *~
+
+# kubectl client cache (~/.kube equivalent on the host)
+.kube/
+
+# Extracted chart directories (charts are kept as *.tgz in
+# infra/helm-charts/; the extracted trees are working copies of
+# helm_cache.py / gateway.py / etc.)
+infra/helm-charts/*/

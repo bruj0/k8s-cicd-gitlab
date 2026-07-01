@@ -66,6 +66,12 @@ class GitlabInstaller(HelmAppInstaller):
                 release=self.RELEASE,
                 namespace=self.NAMESPACE,
                 wait=False,  # GitLab takes minutes to come up; --wait would hang.
+                # Skip the chart's bundled Gateway API CRDs — we install
+                # them ourselves in step 2/13 with `kubectl apply
+                # --server-side --force-conflicts`. Letting helm re-apply
+                # the chart's copies fails with field-manager conflicts
+                # (the `kubectl` field manager owns the CRD annotations).
+                skip_crds=True,
                 values_files=(
                     str(paths.phase2_refs_dir / "helm-values-gitlab.yaml"),
                 ),

@@ -58,6 +58,11 @@ class HelmAppSpec:
     # Absolute paths to helm values files, applied in order. Phase 2 uses
     # this so install-time config lives in committed YAML references.
     values_files: tuple[str, ...] = ()
+    # Skip CRDs in this chart (`helm install --skip-crds`). The GitLab
+    # chart re-bundles the upstream Gateway API CRDs which we install
+    # ourselves in step 2/13 with `--force-conflicts`. Letting helm
+    # apply the chart's copies fails with field-manager conflicts.
+    skip_crds: bool = False
 
 
 @dataclass(frozen=True)
@@ -253,6 +258,8 @@ class HelmAppInstaller:
             argv += ["--namespace", self._spec.namespace]
         if self._spec.wait:
             argv.append("--wait")
+        if self._spec.skip_crds:
+            argv.append("--skip-crds")
         argv += set_args
 
         # Human-readable form: same argv but quoted for shell echo.
@@ -295,6 +302,8 @@ class HelmAppInstaller:
             argv += ["--namespace", self._spec.namespace]
         if self._spec.wait:
             argv.append("--wait")
+        if self._spec.skip_crds:
+            argv.append("--skip-crds")
         argv += set_args
         return argv
 

@@ -202,16 +202,24 @@ global:
         enabled: true
         bucket: gitlab-pages
 
-  # Backup target — chart's toolbox backs up to its own bucket.
-  gitlab:
-    toolbox:
-      enabled: true
-      backups:
-        objectStorage:
-          backend: s3
-          config:
-            secret: gitlab-rails-storage
-            key: connection
+# Registry storage — chart 10.x dropped the bundled object store,
+# so registry must point at our external MinIO. The check
+# `gitlab.checkConfig.objectStorage.registry.configured` fires
+# when `registry.enabled=true` (default) and `registry.storage.secret`
+# isn't set.
+#
+# Note: `registry.storage` only accepts {secret, key, extraKey,
+# redirect} keys (the bucket name is configured inside the Secret
+# body itself, not in values). We also need the `gitlab-registry`
+# bucket to exist in MinIO — see GITLAB_BUCKETS in minio.py.
+registry:
+  storage:
+    secret: gitlab-rails-storage
+    # The chart's registry sub-config block expects a key whose value is
+    # the literal `storage:` YAML block (Docker registry schema, top
+    # level `s3:`). We use the `config` key on a Secret that ALSO has
+    # `connection` (used by Rails-side object storage readers).
+    key: config
 
 # Override the chart's default Gateway listener cert-ref. The chart
 # default (`gitlab-tls`) is the name the chart uses for the
@@ -226,9 +234,45 @@ gatewayApiResources:
           certificateRefs:
             - name: gitlab-wildcard-tls
 
+# The chart-bundled GitLab Runner sub-chart registers against the
+# GitLab instance via `gitlab-runner register`, which uses the
+# `CI_SERVER_URL` env var (falling back to `global.hosts.domain`-based
+# public URL when the env var is unset). Hitting the external URL
+# (https://gitlab.local.bruj0.net) from inside the cluster forces
+# the runner pod to round-trip through the public Gateway AND to
+# trust the self-signed wildcard TLS — both unnecessary for in-cluster
+# registration. The internal webservice Service listens on port
+# 8181 (the chart-internal workhorse port) and speaks plain HTTP
+# (TLS termination happens at the Gateway/Envoy above it, never at
+# port 8181).
+#
+# The Runner sub-chart picks up `gitlab-runner.gitlabUrl` and
+# injects it as CI_SERVER_URL. We also set `unregisterRunners: false`
+# so re-running `helm upgrade` doesn't wipe the existing
+# registration we just made.
+gitlab-runner:
+  gitlabUrl: http://gitlab-webservice-default.gitlab.svc:8181
+  unregisterRunners: false
+  runners:
+    config: |
+      [[runners]]
+        [runners.kubernetes]
+          namespace = "gitlab-runner"
+          image = "ubuntu:22.04"
+        [runners.cache]
+          Type = "local"
+          [runners.cache.local]
+            path = "/tmp"
+
 # Resource caps so GitLab fits on 3×8 GB kind workers.
 # (Chart 19.x is heavier than 18.x — bumped from 4Gi to 8Gi in
 # infra/tofu/variables.tf.)
+#
+# Also includes the toolbox backup object store config — the
+# check `gitlab.checkConfig.objectStorage.backup.configured`
+# reads `$.Values.gitlab.toolbox` (TOP-level `gitlab.toolbox`,
+# NOT `global.gitlab.toolbox` — the subchart's `.Values.toolbox`
+# is the outer chart's `.Values.gitlab.toolbox`).
 gitlab:
   gitaly:
     persistence:
@@ -252,6 +296,15 @@ gitlab:
       replicas: 1
     minReplicas: 1
     maxReplicas: 1
+  # Backup target — chart's toolbox backs up to its own bucket.
+  # Required to satisfy `gitlab.checkConfig.objectStorage.backup.configured`.
+  toolbox:
+    backups:
+      objectStorage:
+        backend: s3
+        config:
+          secret: gitlab-rails-storage
+          key: connection
 
 # --- chart-bundled OpenBao subchart activation ---
 # The chart's top-level `openbao.install: false` default means the

@@ -36,16 +36,18 @@ metadata:
 spec:
   instances: 1
 
-  # Bootstrap the in-pod PostgreSQL data directory. The `initdb`
-  # block creates the `postgres` superuser database; the
-  # `additionalVolumes` mounts the hostPath PV the operator binds
-  # to its PG_DATA subdir.
-  initdb:
-    database: postgres
-    owner: postgres
-    encoding: UTF8
-    locale: C
-    dataChecksums: true
+  # Bootstrap the in-pod PostgreSQL data directory. cnpg 1.30
+  # moved initdb under `bootstrap` (was `initdb:` at top level
+  # in 1.27 and earlier). The initdb block creates the `postgres`
+  # superuser database; dataChecksums is on for PITR-friendliness
+  # (cheap, never disabled in modern PG).
+  bootstrap:
+    initdb:
+      database: postgres
+      owner: postgres
+      encoding: UTF8
+      locale: C
+      dataChecksums: true
 
   # Single PVC backed by our pre-created hostPath PV. The PVC name
   # matches what stable_storage.py pre-creates (Flavor A
@@ -54,14 +56,13 @@ spec:
     size: 8Gi
     storageClass: manual
     pvcTemplate:
-      spec:
-        storageClassName: manual
-        accessModes:
-          - ReadWriteOnce
-        volumeName: pv-cnpg-data
-        resources:
-          requests:
-            storage: 8Gi
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: manual
+      volumeName: pv-cnpg-data
+      resources:
+        requests:
+          storage: 8Gi
 
   # Resources: tuned to fit our 8Gi worker nodes. CNPG defaults to
   # generous limits; we cap to keep kind-node memory pressure low.
@@ -82,14 +83,14 @@ spec:
       shared_buffers: "128MB"
       work_mem: "16MB"
       log_min_duration_statement: "1000"
-  enableInstanceDiskUseOnExtendSize: false
+  # cnpg 1.30 schema: only `enableSuperuserAccess` is accepted here
+  # (`enableInstanceDiskUseOnExtendSize` was removed in 1.30).
   enableSuperuserAccess: true
 
-  # The cnpg operator auto-generates `<cluster>-superuser`,
+  # No monitoring exporters — matches the no-monitoring-everywhere-
+  # else rule. The cnpg operator auto-generates `<cluster>-superuser`,
   # `<cluster>-app`, and `<cluster>-rw` Service + Secret. We only
   # need the superuser Secret (for the bootstrap_dbs step) and the
   # rw Service (consumed by `global.psql.host` in chart values).
-  serviceMonitorTemplate:
-    enabled: false
-  podMonitorTemplate:
-    enabled: false
+  monitoring:
+    enablePodMonitor: false

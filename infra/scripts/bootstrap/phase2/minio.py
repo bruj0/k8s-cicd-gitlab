@@ -52,6 +52,7 @@ GITLAB_BUCKETS = (
     "gitlab-pages",
     "gitlab-dependency-proxy",
     "gitlab-snippets",
+    "gitlab-registry",
 )
 
 ROOT_USER_FILE = "minio-root-user.txt"
@@ -171,11 +172,25 @@ class MinIOInstaller:
             f"Persisted MinIO root credentials to {ROOT_USER_FILE} + {ROOT_PASSWORD_FILE}"
         )
 
-        # Step 2: in-cluster Secret with the S3 connection YAML body.
-        # The GitLab chart reads this as `connection: <yaml-string>`
-        # which it parses into Rails ObjectStorage settings.
+        # Step 2: in-cluster Secret with two keys consumed by chart 10.x:
+        #   - `connection`: Rails-format S3 credentials object (parsed
+        #     by GitLab rails-side object_store configurations:
+        #     lfs/artifacts/uploads/packages/terraform-state/ci-secure-
+        #     files/dependency-proxy/pages/backups). Format is the
+        #     Fog/AWS provider schema (provider, aws_access_key_id,
+        #     aws_secret_access_key, region, endpoint, path_style).
+        #   - `config`: Docker-registry-format S3 driver block. The
+        #     chart's registry sub-chart mounts this as the
+        #     `storage:` block via `registry.storage.key: config` (see
+        #     helm-values-gitlab.yaml). It uses Docker registry's
+        #     native s3 driver fields (accesskey/secretkey/region/
+        #     regionendpoint/secure/v4auth/pathstyle/rootdirectory/
+        #     bucket).
+        # We keep both keys in one Secret so chart 10.x's two
+        # consumers (Rails-side and registry-side) share the same
+        # root-credential source.
         self._ensure_gitlab_namespace()
-        s3_yaml = (
+        connection_yaml = (
             f"provider: AWS\n"
             f"aws_access_key_id: {user}\n"
             f"aws_secret_access_key: {password}\n"
@@ -183,16 +198,37 @@ class MinIOInstaller:
             f"endpoint: http://{MINIO_API_SERVICE}.{MINIO_NAMESPACE}.svc.cluster.local:{MINIO_API_PORT}\n"
             f"path_style: true\n"
         )
+        registry_s3_block = (
+            "s3:\n"
+            f"  bucket: gitlab-registry\n"
+            f"  accesskey: {user}\n"
+            f"  secretkey: {password}\n"
+            f"  region: us-east-1\n"
+            f"  regionendpoint: http://{MINIO_API_SERVICE}.{MINIO_NAMESPACE}.svc.cluster.local:{MINIO_API_PORT}\n"
+            f"  secure: false\n"
+            f"  v4auth: true\n"
+            f"  pathstyle: true\n"
+            f"  rootdirectory: /\n"
+        )
+        # Idempotent: delete (no-op if absent) then create from the
+        # fresh MinIO credentials. The Secret is consumed by the
+        # GitLab chart install (downstream step) so no race here.
+        self.runner.run(
+            ["kubectl", "-n", "gitlab", "delete", "secret",
+             "gitlab-rails-storage", "--ignore-not-found"],
+            check=True,
+        )
         self.runner.run(
             ["kubectl", "-n", "gitlab", "create", "secret", "generic",
              "gitlab-rails-storage",
-             f"--from-literal=connection={s3_yaml}",
+             f"--from-literal=connection={connection_yaml}",
+             f"--from-literal=config={registry_s3_block}",
              "--save-config"],
             check=True,
         )
         self.log.ok(
             "Created Secret `gitlab-rails-storage` in namespace `gitlab` "
-            "(key: connection, target: minio.minio.svc:9000)"
+            "(keys: connection [Rails], config [registry s3], target: minio.minio.svc:9000)"
         )
 
     def _ensure_gitlab_namespace(self) -> None:

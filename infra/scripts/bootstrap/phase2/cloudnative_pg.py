@@ -40,14 +40,8 @@ proper WAL archiving and point-in-time recovery hooks for future use.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
-import os
-import signal
-import subprocess
-import tempfile
-import time
+import secrets
 from dataclasses import dataclass
 
 from ..app_installer import HelmAppInstaller
@@ -97,11 +91,22 @@ class CloudNativePGInstaller:
         self.log.ok("CloudNativePG operator installed")
 
     def install_cluster(self) -> None:
-        """Apply Cluster/postgresql.
+        """Apply Cluster/postgresql + claim-orphan the pre-created PVC.
 
         The Cluster manifest lives at
         `phase2/references/cluster-postgresql.yaml` so it's reviewable
         as a diff and not embedded in Python.
+
+        After applying the Cluster we patch our pre-created
+        `postgresql-cnpg-1` PVC to add an `ownerReference` pointing
+        at the Cluster. Without this, the CNPG operator's
+        `getManagedPVCs` (which uses a `metadata.controller` field
+        index selector) returns an empty list — our pre-created
+        PVC has no owner since bootstrap created it before the
+        Cluster existed. Result: `EnrichStatus` sees no managed
+        PVCs, sets `Status.Instances = 0`, and the cluster loops
+        forever in `createPrimaryInstance` (initdb Job → completed
+        → primary pod never created → initdb Job again).
         """
         if isinstance(self.runner, DryRunRunner):
             return
@@ -112,6 +117,52 @@ class CloudNativePGInstaller:
             check=True,
         )
         self.log.ok(f"Applied {yaml_path.name} (Cluster/{CLUSTER_NAME})")
+
+        # Patch the pre-created PVC to be owned by the Cluster.
+        # The owner UID matches Cluster.metadata.uid, which we read
+        # fresh from the API so we don't have to hard-code it.
+        self._claim_orphan_pvc()
+
+    def _claim_orphan_pvc(self) -> None:
+        """Set Cluster as the controller-owner of `postgresql-cnpg-1`.
+
+        Idempotent: if `ownerReferences` already points at the
+        Cluster, this is a no-op. The block-level JSON merge patch
+        is safe to re-run.
+        """
+        # 1. Read the Cluster's UID
+        cluster_json = self.runner.run(
+            ["kubectl", "-n", CLUSTER_NAMESPACE, "get", "cluster",
+             CLUSTER_NAME, "-o", "json"],
+            check=True,
+        ).stdout
+        cluster = json.loads(cluster_json)
+        cluster_uid = cluster["metadata"]["uid"]
+
+        # 2. Patch the PVC: replace ownerReferences wholesale. We
+        # can't use a strategic-merge here because the existing
+        # field might be missing; a JSON-patch replace-or-add is
+        # safer.
+        owner_ref = [{
+            "apiVersion": "postgresql.cnpg.io/v1",
+            "kind": "Cluster",
+            "name": CLUSTER_NAME,
+            "uid": cluster_uid,
+            "controller": True,
+            "blockOwnerDeletion": True,
+        }]
+        patch = json.dumps(owner_ref)
+        self.runner.run(
+            ["kubectl", "-n", CLUSTER_NAMESPACE, "patch", "pvc",
+             f"{CLUSTER_NAME}-1", "--type=merge",
+             "--patch", f"{{\"metadata\":{{\"ownerReferences\":{patch}}}}}"
+             ],
+            check=True,
+        )
+        self.log.ok(
+            f"Set Cluster/{CLUSTER_NAME} as controller-owner of PVC "
+            f"{CLUSTER_NAME}-1 (so CNPG's field-index selector finds it)"
+        )
 
     def wait_for_ready(self, timeout_s: int = 300) -> None:
         """Block until Cluster/postgresql reports Ready."""
@@ -144,75 +195,57 @@ class CloudNativePGInstaller:
             (GITLAB_DB_USER, GITLAB_DB_NAME),
             (OPENBAO_DB_USER, OPENBAO_DB_NAME),
         ):
-            sql = _create_role_and_db_sql(user, db, passwords[user])
-            self._exec_psql(sql)
+            # ROLE first (idempotent via DO $$ block, ON_ERROR_STOP=1).
+            self._exec_psql(_create_role_sql(user, passwords[user]))
+            # DATABASE second (CREATE DATABASE isn't idempotent — re-run
+            # raises SQLSTATE 42P04 duplicate_database. We treat that
+            # as success since the role + DB we want already exists).
+            self._exec_psql(_create_db_sql(db, user), ignore_errors=True)
             self.log.ok(
-                f"Created role `{user}` + database `{db}` on Cluster/{CLUSTER_NAME}"
+                f"Role `{user}` + database `{db}` provisioned on Cluster/{CLUSTER_NAME}"
             )
 
-    def _exec_psql(self, sql: str) -> None:
-        """Run psql via port-forward to the rw Service.
+    def _exec_psql(self, sql: str, ignore_errors: bool = False) -> None:
+        """Run psql inside the cnpg pod's `postgres` container.
 
-        The cnpg operator exposes a `postgresql-cnpg-rw` Service which
-        the superuser Secret authenticates to. We forward that
-        Service to localhost, then `psql -h 127.0.0.1 -U postgres` with
-        the password from the Secret's `password` key.
+        The cnpg image ships `psql` and the postgres container
+        authenticates over Unix socket (no password) for the
+        `postgres` superuser, so we skip the operator's Secret
+        password dance entirely. The pod's name is deterministic
+        for single-instance clusters: `<cluster>-1` (postgresql-cnpg-1).
+
+        Why not port-forward + .pgpass: the operator writes the
+        superuser password to a Secret at install time, but
+        `ALTER ROLE postgres PASSWORD` runs at boot and the Secret's
+        `password` field doesn't always reflect what's in `pg_authid`
+        (we observed auth failure even after base64-decoding the
+        Secret value). In-pod exec via Unix socket is the only
+        way that doesn't require reconciling with the Secret state.
+
+        Args:
+            sql: SQL string to execute.
+            ignore_errors: if True, don't raise on psql non-zero exit.
+                Used for non-idempotent statements like CREATE DATABASE
+                where re-run legitimately raises SQLSTATE 42P04
+                (duplicate_database).
         """
-        # Read superuser password from the Secret
-        out = self.runner.run(
-            ["kubectl", "-n", CLUSTER_NAMESPACE, "get", "secret", SUPERUSER_SECRET,
-             "-o", "jsonpath={.data.password}"],
-            check=True,
-        )
-        pg_password = base64.b64decode(out.stdout.strip()).decode()
-
-        # Write a temporary .pgpass so psql doesn't prompt
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".pgpass") as f:
-            f.write(f"127.0.0.1:5432:*:postgres:{pg_password}\n")
-            pgpass_path = f.name
-        os.chmod(pgpass_path, 0o600)
-
-        # Start port-forward in the background
-        port = 55432
-        pf = subprocess.Popen(
-            ["kubectl", "-n", CLUSTER_NAMESPACE, "port-forward",
-             f"svc/{RW_SERVICE}", f"{port}:5432"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        pod = f"{CLUSTER_NAME}-1"
+        # The pod has two containers: `bootstrap-controller` (init)
+        # and `postgres` (main). `kubectl exec` with `-c postgres`
+        # targets the running main container.
         try:
-            # Wait for the port-forward to be ready
-            for _ in range(30):
-                time.sleep(0.5)
-                try:
-                    s = subprocess.run(
-                        ["ss", "-tln", f"sport = :{port}"],
-                        capture_output=True, text=True,
-                    )
-                    if str(port) in s.stdout:
-                        break
-                except Exception:
-                    pass
-
-            # Run psql
-            subprocess.run(
-                ["psql", "-h", "127.0.0.1", "-p", str(port),
-                 "-U", "postgres", "-d", "postgres",
+            self.runner.run(
+                ["kubectl", "-n", CLUSTER_NAMESPACE, "exec", pod, "-c", "postgres",
+                 "--", "psql", "-U", "postgres", "-d", "postgres",
                  "-v", "ON_ERROR_STOP=1", "-c", sql],
-                env={**os.environ, "PGPASSFILE": pgpass_path,
-                     "PGHOST": "127.0.0.1", "PGPORT": str(port),
-                     "PGUSER": "postgres", "PGDATABASE": "postgres"},
                 check=True,
             )
-        finally:
-            pf.send_signal(signal.SIGTERM)
-            try:
-                pf.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pf.kill()
-            try:
-                os.unlink(pgpass_path)
-            except OSError:
-                pass
+        except Exception as e:
+            if ignore_errors and ("already exists" in str(e).lower() or "42P04" in str(e)):
+                # Idempotent re-run: the CREATE DATABASE we wanted is
+                # already there. Quietly move on.
+                return
+            raise
 
     def snapshot_passwords(self) -> None:
         """Write role passwords to infra/secrets/ + create in-cluster Secret.
@@ -242,11 +275,21 @@ class CloudNativePGInstaller:
 
         # Step 2: in-cluster Secret (so the GitLab chart can consume it)
         self._ensure_gitlab_namespace()
+        # Idempotent: `kubectl create secret` fails on re-run if the
+        # Secret already exists. We delete first (no-op if absent),
+        # then create from the freshly generated passwords. Safe
+        # because no pod is consuming this Secret yet — the GitLab
+        # chart install is downstream of this step.
+        self.runner.run(
+            ["kubectl", "-n", "gitlab", "delete", "secret",
+             "cnpg-role-passwords", "--ignore-not-found"],
+            check=True,
+        )
         self.runner.run(
             ["kubectl", "-n", "gitlab", "create", "secret", "generic",
              "cnpg-role-passwords",
-             "--from-literal=gitlab", passwords[GITLAB_DB_USER],
-             "--from-literal=openbao", passwords[OPENBAO_DB_USER],
+             f"--from-literal={GITLAB_DB_USER}={passwords[GITLAB_DB_USER]}",
+             f"--from-literal={OPENBAO_DB_USER}={passwords[OPENBAO_DB_USER]}",
              "--save-config"],
             check=True,
         )
@@ -263,42 +306,62 @@ class CloudNativePGInstaller:
         )
 
     def _load_or_init_passwords(self) -> dict[str, str]:
-        """Read existing role passwords from disk, or generate stable ones.
+        """Read existing role passwords from disk, or generate random ones.
 
-        Stable passwords are derived from the role name via SHA-256 +
-        base64 so cluster recreate deterministically lands on the same
-        credentials (the same approach we use elsewhere for the chart
-        Secrets snapshot). This means the snapshot file works across
-        `tofu destroy && apply` cycles without bcrypt-flapping.
+        Cross-recreate stability is provided by the host-side snapshot
+        file itself: if `infra/secrets/cnpg-role-passwords.json`
+        exists, we reuse those credentials. If not, we generate fresh
+        random passwords via `secrets.token_urlsafe`. Either way the
+        passwords that land in PostgreSQL are the same ones that end
+        up in the in-cluster `cnpg-role-passwords` Secret.
         """
         path = self.paths.secrets_dir / ROLE_PASSWORDS_FILE
         if path.exists():
             return json.loads(path.read_text())
         return {
-            GITLAB_DB_USER: _stable_password(GITLAB_DB_USER),
-            OPENBAO_DB_USER: _stable_password(OPENBAO_DB_USER),
+            GITLAB_DB_USER: _random_password(),
+            OPENBAO_DB_USER: _random_password(),
         }
 
 
-def _stable_password(user: str) -> str:
-    """Deterministic per-role password (24 chars)."""
-    digest = hashlib.sha256(b"cnpg-blueprint:" + user.encode()).digest()
-    return base64.urlsafe_b64encode(digest[:24]).decode().rstrip("=")
+def _random_password() -> str:
+    """Cryptographically random password (32 chars).
+
+    `secrets.token_urlsafe(24)` produces 24 random bytes encoded as
+    32 url-safe characters — strong enough for a local-dev blueprint
+    and easily pasted into kubectl commands when debugging.
+    """
+    return secrets.token_urlsafe(24)
 
 
-def _create_role_and_db_sql(user: str, db: str, password: str) -> str:
-    """Idempotent CREATE ROLE + CREATE DATABASE.
+def _create_role_sql(user: str, password: str) -> str:
+    """Idempotent CREATE ROLE + password reconciliation.
 
-    The DO $$ / \\gexec pattern lets psql execute the SQL blocks
-    conditionally without a transaction wrapper. Both CREATE
-    statements are no-ops on re-run.
+    Two cases:
+      1. Role doesn't exist → CREATE ROLE with the snapshot password.
+      2. Role exists → ALTER ROLE so the stored password matches
+         the snapshot. Without this, a stale DB role (left over
+         from a prior run where bootstrap crashed between role
+         creation and the snapshot write) would keep its old
+         SCRAM-SHA-256 hash and reject every auth attempt against
+         the freshly-minted in-cluster `cnpg-role-passwords` Secret.
     """
     return (
         f"DO $$ BEGIN "
         f"IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{user}') THEN "
         f"CREATE ROLE {user} LOGIN PASSWORD '{password}'; "
+        f"ELSE "
+        f"ALTER ROLE {user} WITH PASSWORD '{password}'; "
         f"END IF; "
-        f"END $$; "
-        f"SELECT 'CREATE DATABASE {db} OWNER {user}' "
-        f"WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '{db}') \\gexec"
+        f"END $$;"
     )
+
+
+def _create_db_sql(db: str, owner: str) -> str:
+    """Plain CREATE DATABASE.
+
+    PG doesn't support IF NOT EXISTS for CREATE DATABASE, so the
+    caller wraps this in ON_ERROR_STOP=off and treats SQLSTATE
+    42P04 (duplicate_database) as a successful no-op.
+    """
+    return f"CREATE DATABASE {db} OWNER {owner}"

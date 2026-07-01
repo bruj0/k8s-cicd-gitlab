@@ -10,6 +10,18 @@
 # Use the Kubernetes executor so each CI job runs in its own pod.
 
 runners:
+  # The GitLab instance is reached IN-CLUSTER via the GitLab
+  # chart's `gitlab-webservice-default` Service on port 8181
+  # (the chart-internal workhorse port). Using the external
+  # `gitlab.local.bruj0.net:443` URL from inside the cluster
+  # would force the runner pod to resolve the public hostname
+  # and hit the Gateway — that round-trip is unnecessary and
+  # in some environments (no DNS resolver for the public name)
+  # the registration fails with `connect: connection refused`.
+  # The runner container also has insecure-set so it can talk
+  # to webservice's self-signed cert without cert errors.
+  url: https://gitlab-webservice-default.gitlab.svc:8181
+  insecure: true
   executor: kubernetes
   config: |
     [[runners]]

@@ -117,6 +117,14 @@ class StableVolume:
     # currently inject this; it's documented so the GitLab / OpenBao
     # value overrides know which keys to add.
     pvc_labels_path: str = ""
+    # Annotations to stamp on the pre-created PVC (Flavor A only).
+    # Required for CNPG: the operator's `EnrichStatus` only counts
+    # PVCs whose `cnpg.io/nodeSerial` annotation parses to an int
+    # AND whose name matches `<cluster>-<serial>`. Without these,
+    # `cluster.Status.Instances` stays at 0 and the operator loops
+    # in `createPrimaryInstance` → "refusing to create the primary
+    # instance because the cluster already initialized".
+    pvc_annotations: dict[str, str] = field(default_factory=dict)
 
     @property
     def host_path(self) -> str:
@@ -147,20 +155,46 @@ STABLE_VOLUMES: tuple[StableVolume, ...] = (
     # --- Flavor A: existingClaim ------------------------------------
     # External CloudNativePG data — the GitLab chart 10.x no longer
     # bundles PostgreSQL, so we install cnpg ourselves and pin the
-    # operator's auto-minted data PVC (`postgresql-cnpg-data`) to a
-    # hostPath so `tofu destroy && apply` preserves the GitLab
-    # database. The PV pre-creates the PVC here (Flavor A), so the
-    # cnpg operator's StatefulSet picks up our existing PVC instead
-    # of minting a fresh one.
+    # operator's auto-minted data PVC to a hostPath so `tofu
+    # destroy && apply` preserves the GitLab database. The PV
+    # pre-creates the PVC here (Flavor A), so the cnpg operator's
+    # StatefulSet picks up our existing PVC instead of minting a
+    # fresh one.
+    #
+    # CRITICAL: the PVC name must be `<cluster>-<nodeSerial>` —
+    # e.g. `postgresql-cnpg-1` for serial 1 of cluster
+    # `postgresql-cnpg`. The CNPG reconciler computes the
+    # expected PVC name from `specs.GetInstanceName(cluster.Name,
+    # serial)` and `EnrichStatus()` SKIPS any PVC in the
+    # namespace whose `cnpg.io/nodeSerial` annotation is missing
+    # OR whose name doesn't match. Pre-creating a PVC with the
+    # wrong name (e.g. `postgresql-cnpg-data`) makes
+    # `cluster.Status.Instances = 0`, which sends the operator
+    # into a reconcile loop calling `createPrimaryInstance` →
+    # "refusing to create the primary instance because the
+    # cluster already initialized" + "PhaseUnrecoverable" on
+    # every cycle (~10/s).
     StableVolume(
         "existing_claim", "postgresql", "cnpg", "postgresql/cnpg", "8Gi",
         pv_name="pv-cnpg-data",
-        pvc_name="postgresql-cnpg-data",
+        pvc_name="postgresql-cnpg-1",
         # CloudNativePG Cluster exposes `storage.spec.pvcName` for
         # this exact purpose. See:
         # https://cloudnative-pg.io/documentation/1.30/cloudnative-pg.v1/#postgresql-api
         chart_value_path="",
         chart_value="",
+        # Stamp the CNPG labels + nodeSerial annotation on our
+        # pre-created PVC so the operator's `EnrichStatus` recognises
+        # it as belonging to instance 1 of `postgresql-cnpg`. Without
+        # these, the PVC is filtered out → `Status.Instances = 0` →
+        # reconcile loop.
+        pvc_annotations={
+            "cnpg.io/cluster": "postgresql-cnpg",
+            "cnpg.io/instanceName": "postgresql-cnpg-1",
+            "cnpg.io/instanceRole": "primary",
+            "cnpg.io/nodeSerial": "1",
+            "cnpg.io/pvcRole": "PG_DATA",
+        },
     ),
     # External Redis data — chart 10.x consumes Redis externally
     # via `global.redis.host`. The bitnami/redis chart creates a
@@ -324,13 +358,18 @@ spec:
 """
 
     def _pvc_existing_claim_yaml(self, vol: StableVolume) -> str:
+        annotations_yaml = ""
+        if vol.pvc_annotations:
+            annotations_yaml = "  annotations:\n" + "".join(
+                f"    {k}: {v!r}\n" for k, v in vol.pvc_annotations.items()
+            )
         return f"""\
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {vol.pvc_name}
   namespace: {vol.namespace}
-  labels:
+{annotations_yaml}  labels:
     app.kubernetes.io/managed-by: blueprint-stable-storage
     app.kubernetes.io/component: {vol.component}
     blueprint/stable-volume: "{vol.component}"

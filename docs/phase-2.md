@@ -1,4 +1,4 @@
-# Phase 2 — Install GitLab, Runner, OpenBao on a Phase-1 cluster
+# Phase 2 — Install GitLab + Runner + OpenBao on a Phase-1 cluster
 
 This phase installs the application stack on top of the 5-node kind
 cluster that Phase 1 created. Everything here is **idempotent** —
@@ -15,18 +15,50 @@ debug a failure, or understand why something is the way it is.
 After `uv run blueprint-bootstrap --phase 2` finishes on a healthy
 Phase-1 cluster, you have:
 
-  - **OpenBao** running in the `openbao` namespace, initialised +
-    unsealed, with a KV-v2 mount at `secret/` and the root token
-    persisted to `infra/secrets/openbao-init.json` (gitignored,
-    mode 0600).
-  - **GitLab CE** running in the `gitlab` namespace. The chart
-    sub-installs **Envoy Gateway 1.7.1** as a managed sub-chart
-    (`gateway-helm`) and mints a **self-signed wildcard cert**
-    for `*.local.bruj0.net` via a pre-install cfssl Job.
-  - **GitLab Runner** in `gitlab-runner`, registered against
+  - **CloudNativePG operator + Cluster/postgresql-cnpg** in the
+    `postgresql` namespace — single instance, 8Gi, bound to the
+    stable PV via a pre-created PVC named `postgresql-cnpg-1`.
+    The bootstrap mints the `gitlab` and `openbao` PG roles
+    (their passwords are persisted to
+    `infra/secrets/cnpg-role-passwords.json`, mode 0600) and the
+    `gitlabhq_production` + `openbao` databases.
+  - **Redis single-node** in the `redis` namespace
+    (`architecture=standalone`, no Sentinel, no replicas), bound
+    to the stable PV. Password snapshot at
+    `infra/secrets/redis-password.txt`.
+  - **MinIO single-node** in the `minio` namespace — single pod,
+    no distributed mode, no erasure coding. 11 GitLab buckets are
+    created via in-cluster `mc`. Root credentials snapshotted to
+    `infra/secrets/minio-root-{user,password}.txt`. A dual-key
+    `gitlab-rails-storage` Secret in the `gitlab` namespace
+    carries both the Rails-side `connection` and the
+    Docker-registry-native `config` (see § *Stable storage / MinIO
+    object store* below).
+  - **OpenBao** in the `openbao` namespace — the
+    **bootstrap-installed OpenBao**, initialised + unsealed,
+    KV-v2 mount at `secret/`, root token + unseal key persisted to
+    `infra/secrets/openbao-init.json` (gitignored, mode 0600).
+    Used by the bootstrap itself as a hand-off point
+    (`OpenBaoClient` + `blueprint-secrets` CLI).
+  - **Wildcard TLS** — self-signed CA + wildcard cert for
+    `*.local.bruj0.net` materialised as `gitlab-wildcard-tls` (plus
+    3 listener-specific aliases `registry-tls` / `kas-tls` /
+    `minio-tls`) in the `gitlab` namespace.
+  - **GitLab CE** in the `gitlab` namespace. Chart 10.x
+    sub-installs **Envoy Gateway** as a managed sub-chart
+    (`gateway-helm`) and bundles **OpenBao** as a managed
+    sub-chart (`chart-bundled OpenBao` → `gitlab-openbao`
+    Deployment; the GitLab rails app uses it for Secrets Manager).
+    The chart also re-uses the externally-installed CloudNativePG,
+    Redis, and MinIO via `global.psql.host`, `global.redis.host`,
+    and `appConfig.object_store.*.connection.secret`.
+  - **GitLab Runner** in `gitlab` (sub-chart) registered against
     GitLab using a token that was captured into OpenBao at
     `secret/gitlab/runner/registration_token` during the GitLab
-    install step.
+    install step. The Runner registers against
+    `http://gitlab-webservice-default.gitlab.svc:8181` (in-cluster
+    Service DNS, not the public hostname — see § *Runner URL*
+    below).
   - All the secrets a developer needs to bootstrap the cluster in
     their `/etc/hosts` + browser, in OpenBao — not in git, not on
     disk outside the gitignored init JSON.
@@ -42,37 +74,64 @@ self-signed wildcard. Trust the CA on the host first (see
 | `https://gitlab.local.bruj0.net`           | `root` / OpenBao secret                            | GitLab web UI + API              |
 | `https://registry.local.bruj0.net`         | `root` / OpenBao secret                            | GitLab Container Registry        |
 | `https://kas.local.bruj0.net`              | `root` / OpenBao secret                            | GitLab Agent Server (KAS)        |
-| `https://minio.local.bruj0.net`            | `root` / OpenBao secret                            | MinIO (LFS, artifacts, packages) |
-| `https://openbao.local.bruj0.net`          | root token in `infra/secrets/openbao-init.json`    | OpenBao UI                       |
+| `https://minio.local.bruj0.net`            | `root` / OpenBao secret (Snapshot → MinIO creds)   | MinIO (LFS, artifacts, packages) |
+| `https://openbao.local.bruj0.net`          | root token in `infra/secrets/openbao-init.json`    | **Bootstrap-installed** OpenBao UI (KV-v2 hand-off) |
 
-## 2. The 9-step pipeline
+The **chart-bundled OpenBao** is internal-only — it has no public
+Gateway listener, it talks to the rails app over
+`openbao.gitlab.svc:8200` from inside the cluster. Web admin UI is
+deliberately not exposed. The Secrets Manager API path lives at
+`https://gitlab.local.bruj0.net/api/v4/secrets_manager/...` once
+the admin enables Secrets Manager in the GitLab UI.
+
+## 2. The 13-step pipeline
 
 ```
  1. Pre-flight              cluster + helm reachable
- 2. Gateway CRDs            upstream standard + 2 chart-shipped Envoy CRDs
+ 2. Gateway CRDs            standard v1.5.0 + chart-shipped Envoy CRDs
+                            (8 in `gateway-api-crds/generated/`)
  3. local-path provisioner  rancher/local-path with `local-path` as default
                             StorageClass + bind pathBase → /var/local/shared
  4. Stable PV/PVC pairs     pre-create hostPath-backed PVs for the stateful
                             services we want to preserve across cluster
-                            recreates (PostgreSQL, Redis, Prometheus, Gitaly,
-                            MinIO, OpenBao) — 3 flavors depending on how the
-                            chart mints its PVC.
- 5. OpenBao                 install + init + unseal
- 6. Wildcard TLS certs      mint a self-signed CA + wildcard cert for
+                            recreates (CloudNativePG, Redis, MinIO, OpenBao,
+                            Gitaly) — 3 flavors depending on how the chart
+                            mints its PVC. The CNPG case enforces an extra
+                            PVC name + annotation contract (see § Stable
+                            storage).
+ 5. CloudNativePG           install the operator + Cluster/postgresql-cnpg
+                            (1 instance, 8Gi, FQDN selector) + bootstrap
+                            `gitlabhq_production` + `openbao` databases
+                            and the corresponding roles
+ 6. Redis                   install bitnami/redis single-node
+                            (architecture=standalone)
+ 7. MinIO                   install minio (mode: standalone) + 11 buckets
+                            + dual-key `gitlab-rails-storage` Secret
+ 8. OpenBao                 install + init + unseal (PG backend =
+                            CloudNativePG, database `openbao`)
+ 9. Wildcard TLS certs      mint a self-signed CA + wildcard cert for
                             *.local.bruj0.net and materialise the 4 Gateway
                             listener Secrets. Idempotent: re-uses a cert that
                             has ≥30 days of validity left.
- 7. Persistent Secrets      restore chart-managed Secrets (postgres/redis/
+10. Persistent Secrets      restore chart-managed Secrets (postgres/redis/
                             minio/rails/gitaly/kas) from the host-side
                             snapshot so the chart sees them already exist
                             and re-uses the same credentials as the on-disk
                             data — without this, PG logs
                             `password authentication failed` after every
                             cluster recreate.
- 8. GitLab                  chart + Envoy sub-chart + token capture + write
-                            initial root password to OpenBao
- 9. GitLab Runner           install with the registration token from OpenBao
-                            (snapshotted into OpenBao by step 8)
+11. GitLab                  install chart 10.x (bundles Envoy Gateway +
+                            chart-bundled OpenBao subchart) + token
+                            capture + write initial root password to
+                            OpenBao + re-create the bootstrap-minted
+                            PG roles if the cluster was recreated
+                            without `--destroy`
+12. Migrations              wait for the chart-managed migrations Job
+                            to complete (skipped on subsequent
+                            re-installs)
+13. GitLab Runner           install + register against
+                            `http://gitlab-webservice-default.gitlab.svc:8181`
+                            using the token captured by step 11
 ```
 
 Each step is one method on `Phase2Pipeline` (`_step_*`) and one
@@ -159,25 +218,25 @@ infra/scripts/bootstrap/
 ├── app.py                        # composition root — wires Phase2Installers into BootstrapApp
 ├── app_installer.py              # base class HelmAppInstaller + generic helm plumbing
 ├── phase2/
-│   ├── pipeline.py               # Phase2Pipeline — orchestrates the 9 steps
+│   ├── pipeline.py               # Phase2Pipeline — orchestrates the 13 steps
 │   ├── catalog.py                # Phase2Installers dataclass — bundle of every installer
-│   ├── gateway.py                # GatewayCRDsInstaller (upstream + chart-shipped CRDs)
+│   ├── gateway.py                # GatewayCRDsInstaller (standard v1.5.0 + 8 chart-shipped Envoy CRDs)
 │   ├── local_path_provisioner.py # local-path StorageClass + teardown patches
-│   ├── stable_storage.py         # pre-create stable PV/PVC pairs
-│   ├── openbao.py                # OpenBaoInstaller (chart + init + unseal)
+│   ├── stable_storage.py         # pre-create stable PV/PVC pairs (3 flavors + CNPG name/annotation contract)
+│   ├── cloudnative_pg.py         # CNPG operator + Cluster/postgresql-cnpg + role/db bootstrap
+│   ├── redis.py                  # bitnami/redis single-node installer (architecture=standalone)
+│   ├── minio.py                  # MinIO single-node installer + 11 buckets + dual-key Secret
+│   ├── openbao.py                # OpenBaoInstaller (chart + init + unseal; PG backend)
 │   ├── wildcard_certs.py         # mint CA + wildcard cert + 4 Gateway listener Secrets
 │   ├── persistent_secrets.py     # snapshot + restore chart-managed Secrets
-│   ├── gitlab.py                 # GitlabInstaller (chart + token capture)
-│   ├── runner.py                 # GitLabRunnerInstaller
+│   ├── gitlab.py                 # GitlabInstaller (chart 10.x + token capture + write root pw to OpenBao)
+│   ├── runner.py                 # GitLabRunnerInstaller (in-cluster Service URL, HTTP)
 │   ├── secrets.py                # OpenBaoClient (hvac + auto port-forward)
 │   └── references/
-│       ├── helm-values-openbao.yaml
-│       ├── helm-values-gitlab.yaml   # also pins minio.persistence.volumeName → pv-gitlab-minio
-│       ├── helm-values-runner.yaml
-│       └── gateway-api-crds/    # 3 vendored CRD files
-│                                  #   - gatewayapi-crds.yaml (upstream standard)
-│                                  #   - gateway.envoyproxy.io_envoyproxies.yaml
-│                                  #   - gateway.envoyproxy.io_clienttrafficpolicies.yaml
+│       ├── cluster-postgresql.yaml
+│       ├── helm-values-{cnpg,redis,minio,openbao,gitlab,runner}.yaml
+│       └── gateway-api-crds/    # generated/ subdir contains 8 chart-shipped Envoy CRDs;
+│                                  # the standard v1.5.0 CRDs are applied directly from URL
 ```
 
 ### Who calls who
@@ -192,6 +251,12 @@ BootstrapApp (app.py)
         │                                            (3 flavors: existing_claim,
         │                                             volume_claim_template,
         │                                             pvc_with_volume_name)
+        ├─> _step_cloudnative_pg                → CloudNativePGInstaller
+        │                                            (operator + Cluster + role/db bootstrap)
+        ├─> _step_redis                         → RedisInstaller
+        ├─> _step_minio                         → MinIOInstaller
+        │                                            (deploy + 11 buckets + dual-key
+        │                                             gitlab-rails-storage Secret)
         ├─> _step_openbao                       → OpenBaoInstaller
         │                                            └─> OpenBaoClient (init, unseal, kv mounts)
         ├─> _step_wildcard_certs                → WildcardCertsInstaller
@@ -199,7 +264,7 @@ BootstrapApp (app.py)
         ├─> _step_gitlab                        → GitlabInstaller
         │                                            └─> OpenBaoClient (write root password
         │                                                 + capture runner token)
-        ├─> _step_persistent_secrets_snapshot   → PersistentSecretsInstaller.snapshot()
+        ├─> _step_migrations                    → wait for migrations Job to Complete
         └─> _step_runner                        → GitLabRunnerInstaller
                                                      └─> OpenBaoClient (read runner token)
 ```
@@ -254,6 +319,7 @@ them.
    instead:
    - `gitlab-webservice-default.gitlab.svc:8181`
    - `openbao.openbao.svc:8200`
+   - `postgresql-cnpg-rw.postgresql.svc.cluster.local:5432`
 
    If you add a new chart and find yourself wanting to put
    `gitlab.local.bruj0.net` in a value, stop and use the
@@ -430,15 +496,19 @@ from step to source file is:
 
 | Step | Source                                                       |
 | ---- | ------------------------------------------------------------ |
-| 1/9  | `phase2/pipeline.py:_step_preflight`                          |
-| 2/9  | `phase2/gateway.py` + `phase2/references/gateway-api-crds/`   |
-| 3/9  | `phase2/local_path_provisioner.py` (StorageClass + bind-mount patches) |
-| 4/9  | `phase2/stable_storage.py` (3 flavors: `existing_claim` / `volume_claim_template` / `pvc_with_volume_name`) |
-| 5/9  | `phase2/openbao.py` + `phase2/secrets.py` (`OpenBaoClient`) + `phase2/references/helm-values-openbao.yaml` |
-| 6/9  | `phase2/wildcard_certs.py` (CA + cert mint + 4 Gateway listener Secrets) |
-| 7/9  | `phase2/persistent_secrets.py:restore()` + `infra/secrets/gitlab-runtime-secrets.yaml` (host-side snapshot) |
-| 8/9  | `phase2/gitlab.py` + `phase2/references/helm-values-gitlab.yaml` |
-| 9/9  | `phase2/runner.py` + `phase2/references/helm-values-runner.yaml` |
+| 1/13 | `phase2/pipeline.py:_step_preflight`                          |
+| 2/13 | `phase2/gateway.py` + `phase2/references/gateway-api-crds/`   |
+| 3/13 | `phase2/local_path_provisioner.py` (StorageClass + bind-mount patches) |
+| 4/13 | `phase2/stable_storage.py` (3 flavors: `existing_claim` / `volume_claim_template` / `pvc_with_volume_name` + the CNPG name + annotation contract) |
+| 5/13 | `phase2/cloudnative_pg.py` + `phase2/references/cluster-postgresql.yaml` (operator + Cluster + role/db bootstrap) |
+| 6/13 | `phase2/redis.py` + `phase2/references/helm-values-redis.yaml` (bitnami/redis single-node) |
+| 7/13 | `phase2/minio.py` + `phase2/references/helm-values-minio.yaml` (MinIO + 11 buckets + dual-key Secret) |
+| 8/13 | `phase2/openbao.py` + `phase2/secrets.py` (`OpenBaoClient`) + `phase2/references/helm-values-openbao.yaml` |
+| 9/13 | `phase2/wildcard_certs.py` (CA + cert mint + 4 Gateway listener Secrets) |
+| 10/13 | `phase2/persistent_secrets.py:restore()` + `infra/secrets/gitlab-runtime-secrets.yaml` (host-side snapshot) |
+| 11/13 | `phase2/gitlab.py` + `phase2/references/helm-values-gitlab.yaml` (chart-bundled OpenBao subchart + external PG/Redis/MinIO) |
+| 12/13 | `phase2/pipeline.py:_step_migrations` — wait for `gitlab-migrations-*` Job to reach `Complete` |
+| 13/13 | `phase2/runner.py` + `phase2/references/helm-values-runner.yaml` |
 
 In addition:
 
@@ -457,7 +527,156 @@ In addition:
     auto-port-forwards 127.0.0.1:8200 and reads via hvac — no
     `kubectl exec`, no token helper fragility.
 
-## 10. Trade-offs (why it's shaped this way)
+## 10. Stable storage (the contract)
+
+`phase2/stable_storage.py` owns the three flavours of stable PV/PVC
+pair. Two of them are pre-created PVCs with explicit
+`claimRef`/`matchLabels`; the third (CNPG) has an extra contract
+that you will trip over if you don't know it.
+
+### General pairing rules
+
+  - **All PVs use `hostPath`** pointing to
+    `infra/data/shared/stable/<service>/`. The path is created
+    by the bootstrap (mode 0777) and survives `tofu destroy`.
+  - **PVs use `Retain` persistentVolumeReclaimPolicy** so the
+    volume isn't reaped on PVC delete. The bootstrap patches the
+    claimRef out of the PV before re-applying, since the UID of
+    the PVC changes per install.
+  - **Three flavours** depending on how the chart mints its PVC:
+    | Flavour | Used by | Mechanism |
+    | --- | --- | --- |
+    | `existing_claim` | Redis, MinIO, CNPG | chart's `persistence.existingClaim: <name>` (or `spec.selector.matchLabels` for CNPG) |
+    | `volume_claim_template` | OpenBao, Gitaly | StatefulSet picks labels on its PVC; PV uses `matchLabels` |
+    | `pvc_with_volume_name` | (legacy) | non-templated PVC with explicit `volumeName: <pv-name>` |
+
+### CNPG-specific contract
+
+The CloudNativePG operator resolves PVC ownership from the
+field-index selector `.metadata.controller` — it lists every
+PVC whose `metadata.ownerReferences[?(@.controller==true)].uid`
+matches the Cluster's UID. **A pre-created PVC without
+`ownerReferences` is invisible to the operator's reconcile loop**:
+
+  1. **PVC name must match `<cluster-name>-<serial>`.** For our
+     Cluster `postgresql-cnpg` (single instance), that's
+     `postgresql-cnpg-1`. The bootstrap's `StableVolume` dataclass
+     computes the expected name at install time.
+  2. **Required annotations on the PVC:**
+     - `cnpg.io/cluster: postgresql-cnpg`
+     - `cnpg.io/instanceName: postgresql-cnpg-1`
+     - `cnpg.io/instanceRole: primary`
+     - `cnpg.io/nodeSerial: "1"`
+     - `cnpg.io/pvcRole: main`
+  3. **`ownerReferences[]` must contain the Cluster as a
+     `controller: true` reference.** The operator only trusts the
+     `controller: true` flag, NOT just any reference. After the
+     Cluster is created (step 5), `phase2/cloudnative_pg.py`
+     patches the PVC with a single ownerReference pointing at the
+     Cluster's UID. Without this step the operator logs
+     `Refusing to create the primary instance: cluster already
+     initialized` in a loop until the GC reclaims the orphan.
+
+  Both invariants are owned by the bootstrap. Hand-editing PVCs
+  to work around them is a code smell — the bootstrap should be
+  the one fixing it.
+
+## 11. MinIO object store + the dual-key Secret
+
+`phase2/minio.py` does three things in sequence:
+
+  1. **Deploy MinIO** (`mode: standalone`, single pod, no
+     erasure coding) bound to the stable PV.
+  2. **Create 11 GitLab buckets** via in-cluster `mc`
+     (`gitlab-lfs`, `gitlab-artifacts`, `gitlab-uploads`,
+     `gitlab-packages`, `gitlab-backups`,
+     `gitlab-terraform-state`, `gitlab-ci-secure-files`,
+     `gitlab-pages`, `gitlab-dependency-proxy`,
+     `gitlab-snippets`, `gitlab-registry`).
+  3. **Materialise the dual-key Secret** `gitlab-rails-storage`
+     in the `gitlab` namespace. Two keys:
+     - `connection` — Rails-side Fog/AWS provider schema
+       (`provider: AWS`, `aws_access_key_id`, etc.). Consumed by
+       `appConfig.object_store.lfs/artifacts/uploads/.../backups`
+       via `connection.secret` + `connection.key`.
+     - `config` — Docker-registry native `s3:` block
+       (`bucket`, `accesskey`, `secretkey`, `region`,
+       `regionendpoint`, `secure: false`, `v4auth: true`,
+       `pathstyle: true`, `rootdirectory: /`). Consumed by
+       `registry.storage.secret` + `registry.storage.key: config`.
+
+  Don't merge the two keys — the chart-bundled registry and the
+  Rails-side parsers want different schemas; one YAML document
+  that satisfies one will confuse the other. The split is owned
+  by `phase2/minio.py`; `references/helm-values-gitlab.yaml`
+  points the registry at `config` (not the chart default
+  `connection`).
+
+## 12. Chart-bundled OpenBao vs bootstrap-installed OpenBao
+
+There are **two** OpenBao deployments in the cluster, with
+overlapping but distinct roles:
+
+  | | Bootstrap-installed | Chart-bundled |
+  | --- | --- | --- |
+  | Chart | `openbao-0.10.1` (our cached copy in `infra/helm-charts/`) | sub-chart of GitLab 10.x |
+  | Namespace | `openbao` | `gitlab` |
+  | Workload | `StatefulSet/openbao` (1 replica, no HA) | `Deployment/gitlab-openbao` (2 replicas) |
+  | Storage backend | PostgreSQL (`postgresql-cnpg-rw.postgresql.svc.cluster.local`, database `openbao`, role `openbao`) | PostgreSQL (same cluster, same database) |
+  | Used by | The bootstrap itself (`OpenBaoClient`), the `blueprint-secrets` CLI, the developer | The GitLab rails app, for the GitLab **Secrets Manager** API |
+  | Public UI? | YES — Gateway listener `https://openbao.local.bruj0.net` | NO — internal Service only |
+  | Root token | `infra/secrets/openbao-init.json` | Part of the chart's chart-managed Secrets (`gitlab-openbao-secret`, snapshotted to `gitlab-runtime-secrets.yaml` via `persistent_secrets.py`) |
+
+  The bootstrap-installed OpenBao is the **hand-off point** for
+  shared bootstrap state — GitLab's initial root password, the
+  Runner registration token. The chart-bundled OpenBao is a
+  runtime dependency of the rails app, and the chart owns its
+  lifecycle (including its persistence — see
+  `phase2/persistent_secrets.py` for how it lands in
+  `gitlab-runtime-secrets.yaml` so a cluster recreate keeps the
+  Secrets Manager content).
+
+  The two deployments don't interfere because they're in
+  different namespaces with different Service names (`openbao`
+  vs `gitlab-openbao`). The chart's `global.openbao.install:
+  true` setting is what causes the chart-bundled one to deploy.
+
+## 13. Runner URL (where the Runner pod registers)
+
+`phase2/runner.py` installs the chart-bundled GitLab Runner
+sub-chart with:
+
+  ```yaml
+  gitlab-runner:
+    gitlabUrl: http://gitlab-webservice-default.gitlab.svc:8181
+    unregisterRunners: false
+    runners: { ... }
+  ```
+
+  Why these particular values:
+
+  - **`gitlabUrl` is `http://` on port 8181, not `https://` on
+    443 or the public hostname.** Port 8181 is the chart's
+    in-cluster workhorse port; it speaks plain HTTP. TLS
+    terminates at the Envoy Gateway *above* it. Routing the
+    pod through `gitlab.local.bruj0.net:443` would require the
+    pod to resolve that hostname (no CoreDNS rewrite inside
+    the cluster → resolves to 127.0.0.1 → broken) AND trust the
+    wildcard CA (extra config). Neither is worth the trouble for
+    what is a privileged, in-cluster call.
+  - **`unregisterRunners: false` keeps `helm upgrade` from
+    wiping the registration token on every chart upgrade.** The
+    default behaviour is "unregister all runners on helm
+    uninstall/upgrade", which would make every `helm upgrade
+    gitlab` round-trip re-register the runner (and break
+    in-flight jobs).
+
+  If you find yourself wanting to change `gitlabUrl`, **don't**
+  flip it back to the public hostname — see the in-cluster rule
+  in `AGENTS.md § Other rules`. The current value is the result
+  of a multi-attempt debug session, not a guess.
+
+## 14. Trade-offs (why it's shaped this way)
 
 - **Chart-managed TLS instead of cert-manager.** Public
   Let's Encrypt cannot validate `*.local.bruj0.net` (the host
@@ -479,8 +698,8 @@ In addition:
   lazily per process and tears it down on atexit.
 
 - **One phase 2 step per chart, no composite steps.** The
-  pipeline is a flat list of 9 steps today. The temptation to
-  collapse steps (e.g. "install GitLab + Runner + capture
+  pipeline is a flat list of 13 steps today. The temptation
+  to collapse steps (e.g. "install GitLab + Runner + capture
   token" into one mega-step) makes failure diagnosis much
   harder. Keep steps fine-grained: one chart per step, with
   post-install work in the same `install()` method.
@@ -505,8 +724,8 @@ In addition:
   has 10-year validity and the installer skips regen if
   the cert has ≥30 days left.
 - **Stable PVs survive `tofu destroy`, but `--destroy` wipes
-  them.** The stable PV/PVC pairs (PostgreSQL, Redis,
-  Prometheus, Gitaly, MinIO, OpenBao) are bound to hostPath
+  them.** The stable PV/PVC pairs (CloudNativePG, Redis,
+  MinIO, OpenBao, Gitaly) are bound to hostPath
   dirs under `infra/data/shared/stable/`. After `tofu destroy
   && tofu apply && bootstrap --phase 2`, the new cluster's
   PVCs re-bind to those dirs. But the on-disk PostgreSQL
@@ -517,9 +736,13 @@ In addition:
   The `persistent_secrets.py:restore()` step closes that loop
   by re-applying the previous chart-managed Secrets BEFORE
   the chart install (so the chart sees them already exist
-  and reuses them). The inverse case (testing fresh install
-  on top of stale data) is broken by design: that's what
-  `bootstrap --destroy` is for.
+  and reuses them). For chart 10.x the externalised services
+  (CloudNativePG/Redis/MinIO) have an additional layer: the
+  bootstrap re-creates their PG roles + databases from a host
+  snapshot (see `cnpg-role-passwords.json`) when the Cluster
+  was recreated but `--destroy` wasn't run. The inverse case
+  (testing fresh install on top of stale data) is broken by
+  design: that's what `bootstrap --destroy` is for.
 - **`*.local.bruj0.net` resolves on the host, not in the
   cluster.** The Gateway has 4 listeners, one per hostname
   (`gitlab`, `registry`, `kas`, `minio`). Browsers reach
@@ -532,16 +755,23 @@ In addition:
   handshake fails (`unexpected eof while reading`).
 
 - **Vendored CRDs, not the upstream tarball.** The
-  `gateway-api-crds/` directory has 3 files: 1 upstream
-  standard channel + 2 chart-shipped Envoy CRDs. We don't
-  fetch the upstream tarball at install time because that
-  would (a) add a network dependency that the rest of the
-  pipeline doesn't have, (b) pull in CRDs the chart doesn't
-  need (TCPRoute, UDPRoute, BackendTLSPolicy, etc. — all
-  experimental), and (c) make `kubectl diff` noisy.
-  Re-vendoring when versions bump is a manual
-  `curl -sL <url> | yq` against the upstream manifest +
-  the chart's `crds/` dir.
+  `gateway-api-crds/generated/` directory has 8 chart-shipped
+  Envoy policy CRDs (Backends, BackendTrafficPolicies,
+  ClientTrafficPolicies, EnvoyExtensionPolicies,
+  EnvoyPatchPolicies, EnvoyProxies, HTTPRouteFilters,
+  SecurityPolicies). The 1 upstream standard-channel CRD set
+  (Gateway API v1.5.0) is applied directly from the
+  `https://github.com/kubernetes-sigs/gateway-api/...`
+  URL — it doesn't change between chart upgrades, so vendoring
+  it just bloats the repo. We don't fetch the chart's CRDs
+  from a tarball at install time because that would (a) add a
+  network dependency the rest of the pipeline doesn't have,
+  (b) pull in CRDs the chart doesn't need (TCPRoute,
+  UDPRoute, BackendTLSPolicy, etc. — all experimental), and
+  (c) make `kubectl diff` noisy. Re-vendoring when versions
+  bump is a manual `curl -sL <url> | yq` against the
+  chart's `crds/` dir + the chart 10.x nested layout
+  (`gitlab/charts/gateway-helm/charts/crds/crds/`).
 
 - **Idempotency over speed.** A few steps could be faster if
   we skipped the "is this already done?" probe (the openbao
