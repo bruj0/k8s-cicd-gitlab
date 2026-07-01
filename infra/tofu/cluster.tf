@@ -22,20 +22,38 @@ resource "kind_cluster" "cicd" {
         # (pathBase = /var/local/shared, host source = infra/data/shared).
         # Each service (postgres, gitaly, registry, minio, redis, kas,
         # prometheus, rails/uploads, openbao) gets its own sub-directory
-        # under infra/data/shared and survives cluster recreate.
+        # under infra/data/shared.
         #
-        # IMPORTANT: do NOT set `propagation = "Bidirectional"` on this
-        # mount. With a real-fs host source (ext4 on /mnt/data), rshared
-        # propagation causes the host's bind-source files to be deleted
-        # when the kind container is destroyed — the host sees the
-        # container's umount as a propagation event and the kernel
-        # sweeps the source. Default (rprivate) bind propagation is enough
-        # for local-path-provisioner to work because it never needs to
-        # publish mounts from the container back to the host.
+        # Bind propagation toggle — bidirectional mode contract:
+        #   - var.preserve_stateful_data = false (default, 2026-07+):
+        #     propagation = "Bidirectional". `tofu destroy` tears the
+        #     whole cluster down AND wipes the host-side data — chart-
+        #     managed PVC dirs go via local-path's default `rm -rf`
+        #     teardown, hostPath-backed dirs (infra/data/shared/stable/*)
+        #     go via the null_resource.wipe_data destroy provisioner
+        #     below. The "kernel sweeps the source on container umount"
+        #     (which historically warned against Bidirectional) is
+        #     actually the desired behaviour here.
+        #   - var.preserve_stateful_data = true (legacy, 2026-06 and
+        #     earlier): propagation omitted (default None /
+        #     HostToContainer). Cluster recreate leaves infra/data/shared/*
+        #     intact. Users still need to manually re-bind the dirs +
+        #     re-apply the chart-managed Secrets snapshot, AND the
+        #     local-path teardown script must be re-patched to `mv` —
+        #     see infra/scripts/bootstrap/phase2/local_path_provisioner.py
+        #     module docstring for the full list of re-coupling points.
+        #
+        # The earlier "IMPORTANT: do NOT set propagation=..." warning
+        # was correct for the old contract (preserve across recreate).
+        # It is preserved below as a deliberate history note so a future
+        # reader who flips the contract back understands WHY the
+        # toggle exists and what the kernel-vs-explicit-provisioner
+        # trade-off is.
         extra_mounts {
           host_path      = local.shared_host_abs
           container_path = "/var/local/shared"
           read_only      = false
+          propagation    = var.preserve_stateful_data ? null : "Bidirectional"
         }
 
         labels = {
@@ -141,6 +159,74 @@ resource "null_resource" "smoke_test" {
       KUBECONFIG='${abspath(var.kubeconfig_path)}' kubectl get nodes -o wide > '${path.module}/.last_smoke.json.tmp'
       mv '${path.module}/.last_smoke.json.tmp' '${path.module}/.last_smoke.json'
       KUBECONFIG='${abspath(var.kubeconfig_path)}' kubectl wait --for=condition=Ready node --all --timeout=180s
+    EOT
+  }
+}
+
+###############################################################################
+# Bidirectional-mode destroy hook.
+#
+# `tofu destroy` normally only tears down resources declared in this
+# module (the kind cluster + the side-by-side kubeconfig). The host-side
+# data under infra/data/shared/ — the hostPath PV backing dir, plus
+# chart-managed PVC dirs that local-path-provisioner creates via the
+# bind-mount — is invisible to terraform. Without this hook, `tofu
+# destroy && apply` would leave those dirs behind and the next cluster
+# would re-bind against stale state.
+#
+# We pair with the local-path default teardown script (`rm -rf`) so:
+#   1. `tofu destroy` → cluster is removed → local-path's teardown
+#      `rm -rf`s each PVC's host dir.
+#   2. `tofu destroy` → null_resource.destroy hook below → sweeps the
+#      infra/data/shared/stable/* hostPath dirs the bootstrap
+#      pre-creates (CloudNativePG, Redis, MinIO, OpenBao, Gitaly) that
+#      local-path-provisioner doesn't know about.
+#
+# Skipped when var.preserve_stateful_data = true (the legacy contract,
+# for users who want `tofu destroy` to leave data behind).
+###############################################################################
+
+resource "null_resource" "wipe_data" {
+  depends_on = [kind_cluster.cicd]
+
+  triggers = {
+    cluster = kind_cluster.cicd.id
+    preserve_stateful_data = tostring(var.preserve_stateful_data)
+    data_root = abspath(var.data_root)
+  }
+
+  # Nothing to do on apply — only on destroy.
+  #
+  # Destroy-time provisioners can only reference `self.*`, `count.index`,
+  # and `each.key` (not `var.*` or `path.*`). We thread the toggle
+  # through `triggers` (which IS `self`) so the shell script can
+  # read it. If `var.preserve_stateful_data` flips between apply and
+  # destroy, the trigger value changes, tofu destroys + recreates this
+  # null_resource, and the new value runs on the next destroy — which
+  # is the desired "flag was true at apply-time AND destroy-time, so
+  # preserve" semantics.
+  provisioner "local-exec" {
+    when = destroy
+    command = <<-EOT
+      set -e
+      if [ "${self.triggers.preserve_stateful_data}" = "true" ]; then
+        echo "[wipe_data] preserve_stateful_data=true — leaving infra/data/shared/ intact"
+        exit 0
+      fi
+      SHARED='${abspath(self.triggers.data_root)}/shared'
+      if [ -d "$SHARED" ]; then
+        echo "[wipe_data] removing $SHARED"
+        # Pod-UID-owned leftovers may resist `rm -rf`; fall back
+        # to a privileged container with the host dir bind-
+        # mounted (same trick the bootstrap's --destroy uses —
+        # see infra/scripts/bootstrap/cli.py).
+        if ! rm -rf "$SHARED"; then
+          echo "[wipe_data] unprivileged rm failed, falling back to privileged container"
+          docker run --rm \
+            -v "${abspath(self.triggers.data_root)}:/data" \
+            alpine sh -c "rm -rf /data/shared/*" || true
+        fi
+      fi
     EOT
   }
 }

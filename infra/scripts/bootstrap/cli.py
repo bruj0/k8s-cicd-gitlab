@@ -102,15 +102,41 @@ from .app import BootstrapApp
     help=(
         "Wipe EVERYTHING the bootstrap manages: run `tofu destroy` "
         "on infra/tofu to remove the kind cluster, then delete the "
-        "host-side tree under infra/data/ (preserved service data, "
-        "orphaned local-path-provisioner subdirs), infra/tls/wildcard/ "
-        "(self-signed CA + cert), infra/secrets/openbao-init.json "
-        "(root token + unseal key), and infra/secrets/gitlab-runtime-secrets.yaml "
-        "(chart-managed passwords). Use this when you want a true "
-        "from-scratch reset; the next `bootstrap --phase 2` will "
-        "recreate everything as if for the first time. Requires "
-        "`--yes` to actually run (otherwise just prints what it would "
-        "do)."
+        "host-side tree under infra/data/shared/ (stable hostPath "
+        "PVC backing dirs for CNPG / Redis / MinIO / OpenBao / "
+        "Gitaly + chart-managed *.preserved-* leftovers), "
+        "infra/tls/wildcard/ (self-signed CA + cert), "
+        "infra/secrets/openbao-init.json (root token + unseal key), "
+        "and infra/secrets/gitlab-runtime-secrets.yaml (chart-managed "
+        "passwords). Use this when you want a true from-scratch reset; "
+        "the next `bootstrap --phase 2` will recreate everything as if "
+        "for the first time. Requires `--yes` to actually run "
+        "(otherwise just prints what it would do). Pair with "
+        "`--preserve-data` (inverse: skip the data wipe) for users "
+        "who want the cluster gone but the host-side stateful dirs "
+        "left intact (the legacy 2026-06 contract)."
+    ),
+)
+@click.option(
+    "--preserve-data",
+    "preserve_data",
+    is_flag=True,
+    help=(
+        "Inverse of the default destroy contract: `bootstrap "
+        "--destroy --preserve-data` runs `tofu destroy` with "
+        "`var.preserve_stateful_data=true`, which keeps the host-side "
+        "infra/data/shared/stable/* dirs (and chart-managed PVC "
+        "leftovers via the `mv` teardown script) intact. Useful when "
+        "you want to recreate the cluster but reuse the on-disk PG / "
+        "Redis / MinIO / OpenBao / Gitaly data — note this requires "
+        "the chart-managed Secrets snapshot to also be present "
+        "(infra/secrets/gitlab-runtime-secrets.yaml) so the chart "
+        "install picks up the same credentials as the on-disk data, "
+        "else PG logs `password authentication failed`. Mirror of "
+        "the var on the tofu side (`tofu apply "
+        "-var=preserve_stateful_data=true`); the two flags must "
+        "agree — pass the matching tofu var when re-applying the "
+        "cluster."
     ),
 )
 @click.option(
@@ -128,11 +154,12 @@ def main(
     user: bool,
     port_forward_target: str | None,
     destroy: bool,
+    preserve_data: bool,
     confirm_yes: bool,
 ) -> int:
     """Run the bootstrap."""
     if destroy:
-        return _run_destroy(confirm_yes, dry_run)
+        return _run_destroy(confirm_yes, dry_run, preserve_data)
     # Translate click args into the argv shape BootstrapApp.from_argv
     # expects. Keeping BootstrapApp unchanged means we don't have to
     # touch the entire arg-parsing surface in one shot — the click
@@ -259,28 +286,29 @@ def _run_port_forward(target: str) -> int:
         return 0
 
 
-def _run_destroy(confirm_yes: bool, dry_run: bool) -> int:
-    """Wipe the entire blueprint state: cluster + preserved data + secrets.
+def _run_destroy(confirm_yes: bool, dry_run: bool, preserve_data: bool = False) -> int:
+    """Wipe the entire blueprint state: cluster + (optional) data + secrets.
 
     Stages (each prints a clear `[destroy] <stage>` line):
 
       1. `tofu destroy` on infra/tofu (kind cluster, port-forward
          notes, kubeconfig file). Leaves host-side `infra/data/`
          and `infra/secrets/` untouched — those are owned by the
-         bootstrap, not by tofu.
-      2. `infra/data/shared/stable/*` — preserved CloudNativePG,
-         Redis, MinIO, OpenBao + Gitaly state. Without removing
-         these, the next `bootstrap --phase 2` would re-bind to
-         the old data and the credentials in
-         `infra/secrets/cnpg-role-passwords.json` + Redis/MinIO
-         secret files would mismatch, leaving GitLab's
-         migrations to fail with `password authentication failed`.
+         bootstrap, not by tofu. When `--preserve-data` is passed,
+         we pass `-var=preserve_stateful_data=true` to tofu so the
+         cluster's `null_resource.wipe_data` destroy provisioner
+         becomes a no-op (and the bind-mount `propagation` is set
+         to default HostToContainer instead of Bidirectional,
+         keeping the host-side data source intact).
+      2. `infra/data/shared/stable/*` — hostPath PV backing dirs
+         for CloudNativePG, Redis, MinIO, OpenBao + Gitaly state.
+         SKIPPED when `--preserve-data`.
       3. `infra/data/shared/*` (everything NOT under stable/) —
-         leftover PV dirs from previous helm chart installs that
-         local-path-provisioner renamed to `*.preserved-<ts>`
-         during its `teardown` mv. (See infra/scripts/bootstrap/phase2/
-         local_path_provisioner.py — the teardown script does
-         `mv`, not `rm`, so each PVC delete orphans a directory.)
+         leftover PV dirs from previous helm chart installs. Today
+         (2026-07+) local-path's default teardown script is `rm
+         -rf`, so leftovers rarely exist; the `*.preserved-*`
+         glob is a no-op most of the time but covers any
+         hand-flip cases. SKIPPED when `--preserve-data`.
       4. `infra/tls/wildcard/*` — the self-signed CA + cert. The
          next install regenerates these (10-year validity, so this
          only matters if the cluster has been compromised).
@@ -305,6 +333,10 @@ def _run_destroy(confirm_yes: bool, dry_run: bool) -> int:
     Args:
         confirm_yes: skip the interactive y/N prompt (for scripts).
         dry_run: print what would be removed without removing.
+        preserve_data: keep host-side infra/data/shared/* intact
+            (skips stages 2-3 in this list). Mirrors the tofu
+            `var.preserve_stateful_data = true`; the two MUST
+            agree when re-applying.
     """
     blueprint_root = Path(__file__).resolve().parent.parent.parent.parent
     infra = blueprint_root / "infra"
@@ -316,9 +348,10 @@ def _run_destroy(confirm_yes: bool, dry_run: bool) -> int:
 
     stages: list[tuple[str, str, "Callable[[], None]"]] = [
         (
-            "tofu destroy (kind cluster + kubeconfig + smoke test)",
+            f"tofu destroy (kind cluster + kubeconfig + smoke test; "
+            f"preserve_data={'true' if preserve_data else 'false'})",
             str(tofu_dir),
-            lambda: _run_tofu_destroy(tofu_dir, dry_run),
+            lambda: _run_tofu_destroy(tofu_dir, dry_run, preserve_data),
         ),
         (
             "stable service data (cnpg/redis/minio/openbao/gitaly)",
@@ -368,20 +401,51 @@ def _run_destroy(confirm_yes: bool, dry_run: bool) -> int:
         ),
     ]
 
+    if preserve_data:
+        # Skip the host-side data stages (2 + 3). The list is
+        # built once above; we mutate the lambdas in place so
+        # subsequent calls in the loop see the same callable
+        # objects (Python closures-by-reference). The host-side
+        # tofu destroy already short-circuits via the var, so
+        # the only two stages we need to skip here are the
+        # bootstrap-side rm of stable/ + data_shared.
+        def _noop() -> None:
+            return
+        for idx in (1, 2):
+            stages[idx] = (stages[idx][0] + " [SKIPPED: --preserve-data]", stages[idx][1], _noop)
+
     if not confirm_yes and not dry_run:
-        print(
-            "This will permanently remove:\n"
-            f"  - 1 kind cluster (via tofu destroy)\n"
-            f"  - {stable_dir}\n"
-            f"  - {data_shared} (orphaned *.preserved-* dirs only)\n"
-            f"  - {tls_wildcard}\n"
-            f"  - {secrets_dir / 'openbao-init.json'}\n"
-            f"  - {secrets_dir / 'cnpg-role-passwords.json'}\n"
-            f"  - {secrets_dir / 'redis-password.txt'}\n"
-            f"  - {secrets_dir / 'minio-root-user.txt'}\n"
-            f"  - {secrets_dir / 'minio-root-password.txt'}\n"
-            f"  - {secrets_dir / 'gitlab-runtime-secrets.yaml'}\n"
-        )
+        if preserve_data:
+            print(
+                "This will permanently remove:\n"
+                f"  - 1 kind cluster (via tofu destroy, "
+                f"preserve_stateful_data=true)\n"
+                f"  - {tls_wildcard}\n"
+                f"  - {secrets_dir / 'openbao-init.json'}\n"
+                f"  - {secrets_dir / 'cnpg-role-passwords.json'}\n"
+                f"  - {secrets_dir / 'redis-password.txt'}\n"
+                f"  - {secrets_dir / 'minio-root-user.txt'}\n"
+                f"  - {secrets_dir / 'minio-root-password.txt'}\n"
+                f"  - {secrets_dir / 'gitlab-runtime-secrets.yaml'}\n"
+                f"\n"
+                f"PRESERVED (intentionally, --preserve-data):\n"
+                f"  - {stable_dir}     (CNPG/Redis/MinIO/OpenBao/Gitaly state)\n"
+                f"  - {data_shared}*.preserved-*  (chart-managed leftovers)\n"
+            )
+        else:
+            print(
+                "This will permanently remove:\n"
+                f"  - 1 kind cluster (via tofu destroy)\n"
+                f"  - {stable_dir}\n"
+                f"  - {data_shared} (orphaned *.preserved-* dirs only)\n"
+                f"  - {tls_wildcard}\n"
+                f"  - {secrets_dir / 'openbao-init.json'}\n"
+                f"  - {secrets_dir / 'cnpg-role-passwords.json'}\n"
+                f"  - {secrets_dir / 'redis-password.txt'}\n"
+                f"  - {secrets_dir / 'minio-root-user.txt'}\n"
+                f"  - {secrets_dir / 'minio-root-password.txt'}\n"
+                f"  - {secrets_dir / 'gitlab-runtime-secrets.yaml'}\n"
+            )
         try:
             answer = input("Proceed? [y/N] ")
         except EOFError:
@@ -405,16 +469,34 @@ def _run_destroy(confirm_yes: bool, dry_run: bool) -> int:
     return 0
 
 
-def _run_tofu_destroy(tofu_dir: Path, dry_run: bool) -> None:
-    """Run `tofu destroy` in infra/tofu. No-op if no state exists."""
+def _run_tofu_destroy(
+    tofu_dir: Path, dry_run: bool, preserve_data: bool = False,
+) -> None:
+    """Run `tofu destroy` in infra/tofu. No-op if no state exists.
+
+    When `preserve_data` is true, pass
+    `-var=preserve_stateful_data=true` so the
+    `null_resource.wipe_data` destroy provisioner (which sweeps
+    infra/data/shared/* by default) becomes a no-op and the
+    `extra_mounts.propagation` field defaults to HostToContainer
+    (instead of Bidirectional). The host-side data is then left
+    intact across `tofu destroy`. The user MUST pass the same
+    var to the next `tofu apply` to keep the contract consistent
+    (otherwise the cluster would apply with Bidirectional + a
+    wipe_data hook that re-reads the now-stale value).
+    """
     import subprocess
     tfstate = tofu_dir / "terraform.tfstate"
     if not tfstate.exists() and not dry_run:
         print(f"  (no state at {tfstate}; skipping)")
         return
     cmd = ["tofu", "destroy", "-auto-approve"]
+    if preserve_data:
+        cmd.extend(["-var=preserve_stateful_data=true"])
     if dry_run:
         cmd = ["tofu", "plan", "-destroy"]
+        if preserve_data:
+            cmd.extend(["-var=preserve_stateful_data=true"])
     result = subprocess.run(
         cmd, cwd=str(tofu_dir),
         capture_output=True, text=True,

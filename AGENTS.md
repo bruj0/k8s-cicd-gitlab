@@ -125,7 +125,7 @@ blueprint/
     │   │           ├── pipeline.py      # 13-step orchestrator (called from app.py:BootstrapApp)
     │   │           ├── catalog.py       # Phase2Installers dataclass (bundle of every installer)
     │   │           ├── gateway.py       # GatewayCRDsInstaller — standard v1.5.0 CRDs + chart-shipped Envoy CRDs
-    │   │           ├── local_path_provisioner.py  # local-path StorageClass + teardown patches data → mv + chmod
+    │   │           ├── local_path_provisioner.py  # local-path StorageClass + default 'rm -rf' teardown (2026-07+: cluster-side data wipe on tofu destroy)
     │   │           ├── stable_storage.py   # pre-create stable PV/PVC pairs (existing_claim, volume_claim_template,
     │   │           │                    # pvc_with_volume_name) + CNPG PVC naming + annotation contract
     │   │           ├── cloudnative_pg.py # CNPG operator + Cluster/postgresql-cnpg + role/db bootstrap
@@ -219,14 +219,21 @@ violate any of them, stop and ask.
      state) — partial states produce half-broken Phase 2 installs
      that are very hard to debug.
 
-4. **`bootstrap --destroy` is the symmetric teardown; it never recreates.**
-   The `--destroy` flag is the only way to wipe the **whole** blueprint
-   state from a single command. It runs (a) `tofu destroy`, then
-   (b) recursively removes bootstrap-owned host-side state:
-   - `infra/data/shared/stable/<service>/` — preserved PV data
-     (PostgreSQL, Redis, Prometheus, Gitaly, MinIO, OpenBao).
+4. **`bootstrap --destroy` is the symmetric teardown; it never
+   recreates, and as of 2026-07+ it (together with `tofu destroy`)
+   wipes ALL stateful data.** The `--destroy` flag is the only
+   way to wipe the **whole** blueprint state from a single
+   command. It runs (a) `tofu destroy` (paired with the cluster's
+   `null_resource.wipe_data` destroy provisioner in
+   `infra/tofu/cluster.tf` — see rule #5 below), then (b)
+   recursively removes bootstrap-owned host-side state:
+   - `infra/data/shared/stable/<service>/` — hostPath PV
+     backing dirs (PostgreSQL, Redis, Prometheus, Gitaly, MinIO,
+     OpenBao). WIPED by default as of 2026-07+; preserved only
+     when `--preserve-data` is passed (legacy 2026-06 contract).
    - `infra/data/shared/*.preserved-*` — orphaned local-path
-     provisioner dirs from past helm uninstalls.
+     provisioner dirs from past helm uninstalls (mostly a no-op
+     since the upstream teardown script is now default `rm -rf`).
    - `infra/tls/wildcard/` — the self-signed CA + cert.
    - `infra/secrets/openbao-init.json` — root token + unseal key.
    - `infra/secrets/gitlab-runtime-secrets.yaml` — chart-managed
@@ -235,16 +242,39 @@ violate any of them, stop and ask.
    unlink (openbao=100, postgres=1001), the destroy falls back to a
    one-shot `docker run --rm` (or `podman run`) bind-mounting the
    parent dir so the container can `chmod -R a+rwX && rm -rf` it.
-   **Why a single command matters**: stable PVs survive cluster
-   recreate (the point of `stable_storage.py`), but the on-disk
-   PostgreSQL data was created with credentials that no longer
-   match the freshly chart-minted Secrets. After 1+ `tofu destroy &&
-   apply && bootstrap --phase 2` cycle, GitLab logs
-   `FATAL: password authentication failed for user "gitlab"` and
-   never recovers. `--destroy` resets both halves (data + secrets)
-   in lock-step so the next install is a true clean slate. **Never
-   add an `--apply` style auto-recreate after `--destroy`** — the
-   user must run `tofu apply` themselves, per rule #1.
+   **Why a single command matters**: a `tofu destroy && apply
+   && bootstrap --phase 2` cycle without `--destroy` resets the
+   cluster AND the chart-minted Secrets, but leaves the on-disk
+   PostgreSQL data written with the previous install's random
+   password. GitLab logs `FATAL: password authentication failed
+   for user "gitlab"` and never recovers. With the 2026-07+
+   contract (`tofu destroy` wipes everything via the kernel bind-
+   mount + the bootstrap-side data sweep), this dead-end is
+   avoided by construction. **Never add an `--apply` style auto-
+   recreate after `--destroy`** — the user must run `tofu apply`
+   themselves, per rule #1.
+
+5. **`tofu destroy` is destructive (cluster + cluster-side data)
+   as of 2026-07+. Pass `-var=preserve_stateful_data=true` to opt
+   back into the legacy recreate-with-data contract.** Default is
+   `var.preserve_stateful_data = false`, which:
+     - Sets kind's `extra_mounts.propagation` to `Bidirectional` so
+       the host bind-source sees container umounts as delete events
+       (the older "do NOT set propagation=Bidirectional" warning was
+       correct for the legacy preserve contract; it now describes
+       the desired destructive behaviour).
+     - Activates the `null_resource.wipe_data` destroy provisioner
+       in `infra/tofu/cluster.tf`, which sweeps
+       `infra/data/shared/` (host-side dirs that local-path can't
+       reach) as part of `tofu destroy`.
+   The chart-managed PVC teardown script (`local-path-config` config
+   `teardown` field) reverts to the upstream `rm -rf` default, so
+   per-PVC dirs go too. The bootstrap CLI mirrors this with
+   `--destroy --preserve-data`; the var + flag must agree between
+   apply + destroy or the new install will see a divergent
+   contract. See `infra/tofu/variables.tf:preserve_stateful_data`
+   for the full description + the list of re-coupling points when
+   flipping back.
 
 ### Other rules (less strict but still apply)
 
